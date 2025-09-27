@@ -1,11 +1,12 @@
 # app.py
 from __future__ import annotations
-import os, re, json, base64, time, secrets, unicodedata
-from typing import Optional, List, Dict, Any
+
+import os, re, json, base64, unicodedata
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 import numpy as np
@@ -21,10 +22,8 @@ load_dotenv()  # charge .env si présent
 
 SUPABASE_URL = os.getenv("SUPABASE_URL") or ""
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or ""
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "audio")  # ← crée un bucket public "audio"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
 
-# Seuils / pondérations
 TEXT_SIM_THRESHOLD = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
 MFCC_MIN_SIM       = float(os.getenv("MFCC_MIN_SCORE",  "0.94"))
 MFCC_MIN_ROWS      = int(os.getenv("MFCC_MIN_ROWS",     "8"))
@@ -45,9 +44,18 @@ except Exception as e:
 
 app = FastAPI(title="Kemetia API")
 
+@app.get("/")
+def home():
+    return {"service": "Kemetia API", "status": "ok"}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tu peux restreindre à ton domaine Netlify si tu veux
+    allow_origins=["*"],  # Mets ton domaine Netlify si tu veux serrer
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -145,56 +153,6 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return 1.0 - float(d)
 
 # ──────────────────────────────────────────────
-# Utils Storage (upload audio → Supabase Storage)
-# ──────────────────────────────────────────────
-def _storage_public_url(path: str) -> str:
-    base = SUPABASE_URL.rstrip("/")
-    return f"{base}/storage/v1/object/public/{SUPABASE_BUCKET}/{path.lstrip('/')}"
-
-def _random_name(prefix: str = "rec", ext: str = "webm") -> str:
-    ts = int(time.time() * 1000)
-    rand = secrets.token_hex(6)
-    return f"{prefix}-{ts}-{rand}.{ext}"
-
-def _guess_ext_from_mime(mime: str) -> str:
-    if not mime: return "webm"
-    m = mime.lower()
-    if "ogg" in m: return "ogg"
-    if "mp4" in m: return "m4a"
-    if "mpeg" in m or "mp3" in m: return "mp3"
-    if "wav" in m: return "wav"
-    return "webm"
-
-def upload_bytes_to_storage(data: bytes, mime: str, *, prefix: str="recs") -> tuple[str,str]:
-    """
-    Upload binaire vers Supabase Storage (bucket public).
-    Retourne (public_url, storage_path).
-    """
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise RuntimeError("Supabase non configuré")
-
-    ext = _guess_ext_from_mime(mime)
-    fname = _random_name(prefix=prefix, ext=ext)
-    path = f"{prefix}/{fname}"
-
-    url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
-    r = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Content-Type": mime or "application/octet-stream",
-            "x-upsert": "true",
-            "Cache-Control": "public, max-age=31536000",
-        },
-        data=data,
-        timeout=30,
-    )
-    if r.status_code >= 300:
-        raise HTTPException(status_code=r.status_code, detail=f"upload storage failed: {r.text}")
-    return _storage_public_url(path), path
-
-# ──────────────────────────────────────────────
 # Schémas requêtes
 # ──────────────────────────────────────────────
 class ChatIn(BaseModel):
@@ -218,7 +176,7 @@ class CollectIn(BaseModel):
     en: Optional[str] = None
     filename: Optional[str] = None
     mime: Optional[str] = None
-    audio: Optional[Dict[str, Any]] = None  # { "dataURL": "...", "mime": "...", "filename": "opt" }
+    audio: Optional[str] = None          # dataURL (optionnel)
     duration_ms: Optional[int] = None
     mfcc: Optional[Dict[str, Any]] = None
 
@@ -405,27 +363,6 @@ def api_collect(inp: CollectIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    file_url = None
-    filename = (inp.filename or "").strip() or None
-    mime = (inp.mime or "").strip() or "audio/webm"
-
-    # Upload audio si présent en dataURL
-    if inp.audio and isinstance(inp.audio, dict) and inp.audio.get("dataURL"):
-        try:
-            dataURL = inp.audio["dataURL"]
-            head, b64 = dataURL.split(",", 1)
-            # mime prioritaire: champ fourni > dataURL
-            if not inp.mime:
-                try:
-                    mime = head.split(";")[0].split(":",1)[1]
-                except:
-                    mime = "application/octet-stream"
-            raw = base64.b64decode(b64)
-            file_url, storage_path = upload_bytes_to_storage(raw, mime, prefix="recs")
-            filename = storage_path.split("/")[-1]
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"upload audio failed: {e}")
-
     row = {
         "lang": inp.lang.lower(),
         "category": (inp.category or "").strip() or None,
@@ -434,19 +371,20 @@ def api_collect(inp: CollectIn):
         "reply_same": (inp.reply_same or "").strip() or None,
         "fr": (inp.fr or "").strip() or None,
         "en": (inp.en or "").strip() or None,
-        "filename": filename,
-        "mime": mime,
+        "filename": (inp.filename or "").strip() or None,
+        "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        "url": file_url,
-        "mfcc": json.loads(json.dumps(inp.mfcc)) if inp.mfcc else None,
+        "mfcc": json.loads(json.dumps(inp.mfcc)) if inp.mfcc else None,  # assure JSON serialisable
     }
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
 
+    # NOTE: l'upload audio binaire vers Supabase Storage n'est pas inclus ici (facile à ajouter si besoin).
+    # Ici on enregistre la méta et MFCC (comme ton collect_absorb minimal).
     res = supabase.table("audio_meta").insert(row).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert échoué")
-    return {"ok": True, "id": res.data[0]["id"], "url": file_url, "filename": filename}
+    return {"ok": True, "id": res.data[0]["id"]}
 
 
 @app.post("/api/learn")
@@ -454,7 +392,10 @@ def api_learn(inp: LearnIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    meta = { "ip": None, "ua": "fastapi" }
+    meta = {
+        "ip": None,   # si tu veux logger la vraie IP, mets un middleware ou passe-la du front
+        "ua": "fastapi",
+    }
     row = {
         "row_id": inp.row_id,
         "accepted": bool(inp.accepted),
@@ -478,11 +419,16 @@ def api_stt(payload: Dict[str, Any]):
     """
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=501, detail="STT non configuré (OPENAI_API_KEY manquant)")
-    # TODO: branche Whisper/OpenAI ici si tu veux une vraie transcription
+
+    # Exemple minimal (à remplacer par ton vrai appel Whisper/Audio):
+    # Ici on n'appelle pas l'API distante pour rester simple et éviter des erreurs réseau involontaires.
+    # Intègre ton client OpenAI si besoin.
     return {"text": ""}
 
 
 @app.post("/api/nearby")
 def api_nearby(inp: NearbyIn):
-    # Stub : renvoie vide (branche ton fournisseur plus tard)
+    # Stub propre ; branche ton fournisseur (Google, OSM, etc.) ici.
     return {"items": [], "notice": "Aucun résultat dans ce rayon."}
+
+
