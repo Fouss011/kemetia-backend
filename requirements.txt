@@ -1,0 +1,8 @@
+fastapi
+pydantic>=1.10,<2.0
+uvicorn[standard]
+python-dotenv
+supabase
+requests
+numpy
+scipy
