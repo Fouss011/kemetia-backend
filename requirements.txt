@@ -1,8 +1,10 @@
 fastapi
-pydantic>=1.10,<2.0
 uvicorn[standard]
+pydantic<2.0
 python-dotenv
 supabase
 requests
 numpy
 scipy
+openai>=1.0.0
+python-multipart
