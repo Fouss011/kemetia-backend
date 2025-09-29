@@ -127,21 +127,79 @@ def _decode_dataurl_to_wav_path(data_url: str) -> str:
 
 def _compute_openl3_embedding(wav_path: str) -> list[float]:
     """
-    Calcule l'embedding OpenL3 (512 dims) et renvoie un vector moyen temporel.
+    Calcule un embedding audio OpenL3 (mean-pooling) et renvoie une liste de floats.
+
+    Env optionnelles :
+      AUDIO_EMB_CONTENT_TYPE ∈ {"music","env"}  (defaut: "music")
+      AUDIO_EMB_INPUT_REPR   ∈ {"mel256","mel128"} (defaut: "mel256")
+      AUDIO_EMB_EMBED_SIZE   ∈ {"512","6144"}   (defaut: "512")
     """
-    import openl3  # import here pour éviter de charger si non utilisé
-    y, sr = sf.read(wav_path, always_2d=False)
-    emb, _ = openl3.get_audio_embedding(
-        y, sr, embedding_size=512, input_repr="mel256", content_type="speech"
-    )
-    if emb is None or getattr(emb, "shape", [0])[0] == 0:
+    import os
+    import numpy as np
+    import soundfile as sf
+    import openl3
+
+    # Lire le WAV (déjà transcodé en mono/16k en amont)
+    try:
+        y, sr = sf.read(wav_path, always_2d=False)
+    except Exception as e:
+        raise RuntimeError(f"audio read error: {e}")
+
+    if y is None:
         try: os.remove(wav_path)
         except: pass
         return []
-    vec = np.mean(emb, axis=0).astype(float).tolist()
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim == 2:  # stéréo → mono
+        y = np.mean(y, axis=1)
+    if not y.size or not np.isfinite(y).any():
+        try: os.remove(wav_path)
+        except: pass
+        return []
+
+    # Params via env (avec valeurs sûres)
+    ct = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()
+    if ct not in ("music", "env"):
+        ct = "music"
+
+    inp = os.getenv("AUDIO_EMB_INPUT_REPR", "mel256").lower()
+    if inp not in ("mel256", "mel128"):
+        inp = "mel256"
+
+    es = os.getenv("AUDIO_EMB_EMBED_SIZE", "512")
+    try:
+        es_int = int(es)
+    except Exception:
+        es_int = 512
+    if es_int not in (512, 6144):
+        es_int = 512
+
+    # Calcul OpenL3
+    try:
+        emb, _ = openl3.get_audio_embedding(
+            y, sr,
+            input_repr=inp,
+            content_type=ct,      # "music" ou "env" (pas "speech")
+            embedding_size=es_int
+        )
+    except Exception as e:
+        try: os.remove(wav_path)
+        except: pass
+        raise RuntimeError(f"openl3 error: {e}")
+
+    # Mean-pooling temporel
+    if emb is None or not hasattr(emb, "shape") or emb.shape[0] == 0:
+        try: os.remove(wav_path)
+        except: pass
+        return []
+    vec = np.mean(emb, axis=0)
+    vec = np.where(np.isfinite(vec), vec, 0.0).astype(float)
+
     try: os.remove(wav_path)
     except: pass
-    return vec
+
+    return vec.tolist()
+
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
