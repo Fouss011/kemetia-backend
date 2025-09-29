@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
+import subprocess, tempfile
 import numpy as np
 from scipy.spatial.distance import cosine as cosine_dist
 from supabase import create_client, Client
@@ -20,6 +20,9 @@ from openai import OpenAI
 # Audio embedding deps
 import soundfile as sf
 import openl3
+# === Audio embeddings (OpenL3) – imports ===
+
+
 
 
 # ------------------------- Config & clients -------------------------
@@ -28,6 +31,9 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Toggle pour activer l'endpoint audio-embedding
+USE_AUDIO_EMB = os.getenv("USE_AUDIO_EMB", "0") == "1"
+
 
 TEXT_SIM_THRESHOLD = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
 COMBO_TEXT_WEIGHT  = 0.60  # (gardé si besoin d'évoluer plus tard)
@@ -96,6 +102,46 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# ---------- Audio-embedding helpers (OpenL3) ----------
+def _decode_dataurl_to_wav_path(data_url: str) -> str:
+    """
+    Convertit une dataURL (webm/ogg/wav) en WAV mono 16k, retourne le chemin.
+    Nécessite ffmpeg présent sur la machine.
+    """
+    if not data_url.startswith("data:"):
+        raise ValueError("audio dataURL requis")
+    header, b64 = data_url.split(",", 1)
+    raw = base64.b64decode(b64)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+        f.write(raw)
+        src_path = f.name
+    wav_path = src_path + ".wav"
+    # transcodage → wav mono 16k
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src_path, "-ac", "1", "-ar", "16000", wav_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try: os.remove(src_path)
+    except: pass
+    return wav_path
+
+def _compute_openl3_embedding(wav_path: str) -> list[float]:
+    """
+    Calcule l'embedding OpenL3 (512 dims) et renvoie un vector moyen temporel.
+    """
+    import openl3  # import here pour éviter de charger si non utilisé
+    y, sr = sf.read(wav_path, always_2d=False)
+    emb, _ = openl3.get_audio_embedding(
+        y, sr, embedding_size=512, input_repr="mel256", content_type="speech"
+    )
+    if emb is None or getattr(emb, "shape", [0])[0] == 0:
+        try: os.remove(wav_path)
+        except: pass
+        return []
+    vec = np.mean(emb, axis=0).astype(float).tolist()
+    try: os.remove(wav_path)
+    except: pass
+    return vec
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
@@ -466,6 +512,28 @@ def api_compute_audio_embedding(payload: Dict[str, Any]):
         print("❌ audio-embed error:", e)
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------- Audio-embedding endpoint ----------
+@app.post("/api/compute_audio_embedding")
+def api_compute_audio_embedding(payload: dict):
+    # sécurité: on peut désactiver par env si besoin
+    if not USE_AUDIO_EMB:
+        raise HTTPException(status_code=501, detail="audio-embedding désactivé (set USE_AUDIO_EMB=1)")
+
+    data_url = (payload or {}).get("audio") or ""
+    if not data_url.startswith("data:"):
+        raise HTTPException(status_code=400, detail="audio dataURL requis")
+
+    try:
+        wav_path = _decode_dataurl_to_wav_path(data_url)
+        vec = _compute_openl3_embedding(wav_path)
+        if not vec:
+            raise HTTPException(status_code=500, detail="embedding vide")
+        return {"embedding": vec, "dim": len(vec)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("❌ audio-embed error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------------- Nearby (stub) -------------------------
 @app.post("/api/nearby")
