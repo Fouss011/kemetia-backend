@@ -53,6 +53,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---- Ensure CORS headers even on errors (robust middleware)
+@app.middleware("http")
+async def ensure_cors_headers(request, call_next):
+    try:
+        resp = await call_next(request)
+    except Exception as e:
+        # Si une exception remonte, renvoyer quand même une réponse JSON avec les headers CORS
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"detail": "server error", "error": str(e)},
+            status_code=500,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type,Authorization"
+            }
+        )
+    # Ajoute headers CORS s'ils n'existent pas (sécurité extra)
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    return resp
+
+
 # ---------- Utils texte ----------
 def nk(s: str) -> str:
     t = (s or "").lower()
