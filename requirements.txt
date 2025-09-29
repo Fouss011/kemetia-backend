@@ -1,3 +1,5 @@
+pip==24.3.1
+setuptools<70
 fastapi
 uvicorn[standard]
 pydantic<2.0
