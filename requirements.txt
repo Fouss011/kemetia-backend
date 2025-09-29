@@ -8,3 +8,7 @@ numpy
 scipy
 openai>=1.0.0
 python-multipart
+openl3
+soundfile
+ffmpeg-python
+numpy
