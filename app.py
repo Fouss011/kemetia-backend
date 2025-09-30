@@ -1,42 +1,43 @@
-# app.py — FastAPI (embeddings texte OpenAI + STT Whisper + fallback audio-embeddings OpenL3)
+# app.py — FastAPI (embeddings texte OpenAI + STT Whisper + audio-embeddings OpenL3 en fallback)
 from __future__ import annotations
 
 import os, re, json, base64, tempfile, unicodedata, subprocess, time
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+# --------- ENV avant tout (limiter mémoire / silence GPU/TF) ---------
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("TF_FORCE_CPU", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 import numpy as np
-from supabase import create_client, Client
-
-# OpenAI (>=1.x)
-from openai import OpenAI
-
-# Audio embedding deps
+from scipy.spatial.distance import cosine as cosine_dist
 import soundfile as sf
-import openl3
+from supabase import create_client, Client
+from openai import OpenAI
 
 # ------------------------- Config & clients -------------------------
 load_dotenv()
 
-SUPABASE_URL          = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY  = os.getenv("SUPABASE_SERVICE_KEY", "")
-OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Activer l’endpoint d’embedding audio / fallback serveur
-USE_AUDIO_EMB         = os.getenv("USE_AUDIO_EMB", "0") == "1"
+# Activer/désactiver l’endpoint audio-embedding
+USE_AUDIO_EMB = os.getenv("USE_AUDIO_EMB", "0") == "1"
 
-# OpenL3 params (sûrs par défaut)
-AUDIO_EMB_CONTENT_TYPE = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()   # "music" | "env"
-AUDIO_EMB_INPUT_REPR   = os.getenv("AUDIO_EMB_INPUT_REPR", "mel256").lower()    # "mel256" | "mel128"
-AUDIO_EMB_EMBED_SIZE   = int(os.getenv("AUDIO_EMB_EMBED_SIZE", "512"))          # 512 | 6144
-if AUDIO_EMB_CONTENT_TYPE not in ("music", "env"): AUDIO_EMB_CONTENT_TYPE = "music"
-if AUDIO_EMB_INPUT_REPR not in ("mel256", "mel128"): AUDIO_EMB_INPUT_REPR = "mel256"
-if AUDIO_EMB_EMBED_SIZE not in (512, 6144): AUDIO_EMB_EMBED_SIZE = 512
+# Seuils et pondérations (au besoin)
+TEXT_SIM_THRESHOLD = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
+COMBO_TEXT_WEIGHT  = 0.60
+COMBO_MFCC_WEIGHT  = 0.40
+COMBO_BONUS_SAME   = 0.08
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
@@ -53,61 +54,19 @@ if OPENAI_API_KEY:
         print("❌ OpenAI init error:", e)
 
 app = FastAPI(title="Kemetia API")
+
+# CORS permissif (frontend Netlify)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # si besoin : ["https://kemetia.netlify.app"]
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ... imports + clients + app = FastAPI(...) + middleware CORS ...
-
-@app.on_event("startup")
-def _warm_audio_embedding():
-    """
-    Pré-charger le modèle OpenL3 au démarrage pour éviter le first-call lent/timeout.
-    Ne fait rien si USE_AUDIO_EMB != "1".
-    """
-    import os
-    if os.getenv("USE_AUDIO_EMB", "0") != "1":
-        return
-    try:
-        import numpy as np, openl3
-        sr = 16000
-        y  = np.zeros(sr, dtype=np.float32)  # 1 seconde de silence
-
-        # mêmes paramètres que l’endpoint audio
-        input_repr = os.getenv("AUDIO_EMB_INPUT_REPR", "mel256").lower()
-        if input_repr not in ("mel256", "mel128"):
-            input_repr = "mel256"
-
-        content = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()
-        if content not in ("music", "env"):
-            content = "music"
-
-        try:
-            size = int(os.getenv("AUDIO_EMB_EMBED_SIZE", "512"))
-        except Exception:
-            size = 512
-        if size not in (512, 6144):
-            size = 512
-
-        # premier appel — télécharge/charge le modèle si nécessaire
-        openl3.get_audio_embedding(
-            y, sr,
-            input_repr=input_repr,
-            content_type=content,
-            embedding_size=size
-        )
-        print("✅ OpenL3 warmed")
-    except Exception as e:
-        print("⚠️ OpenL3 warm failed:", e)
-
-
-# Toujours mettre des headers CORS même si exception
+# Toujours renvoyer CORS même si exception
 @app.middleware("http")
-async def ensure_cors_headers(request, call_next):
+async def ensure_cors_headers(request: Request, call_next):
     try:
         resp = await call_next(request)
     except Exception as e:
@@ -126,6 +85,31 @@ async def ensure_cors_headers(request, call_next):
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
     return resp
 
+# --------- (optionnel) Warmup OpenL3 très léger, désactivé par défaut ---------
+@app.on_event("startup")
+def _warm_audio_embedding():
+    if not USE_AUDIO_EMB:
+        return
+    if os.getenv("WARM_OPENL3", "0") != "1":
+        print("ℹ️ OpenL3 warmup skipped (WARM_OPENL3!=1)")
+        return
+    try:
+        import numpy as np
+        import openl3
+        y = np.zeros(16000, dtype=np.float32)  # 1 s de silence
+        input_repr = os.getenv("AUDIO_EMB_INPUT_REPR", "mel128").lower()
+        if input_repr not in ("mel128", "mel256"):
+            input_repr = "mel128"
+        content = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()
+        if content not in ("music", "env"):
+            content = "music"
+        emb, _ = openl3.get_audio_embedding(
+            y, 16000, input_repr=input_repr, content_type=content, embedding_size=512
+        )
+        print("✅ OpenL3 warmed")
+    except Exception as e:
+        print("⚠️ OpenL3 warm failed:", e)
+
 # ------------------------- Utils texte -------------------------
 def nk(s: str) -> str:
     t = (s or "").lower()
@@ -142,12 +126,9 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# ------------------------- Audio helpers (OpenL3) -------------------------
+# --------- Audio helpers ---------
 def _decode_dataurl_to_wav_path(data_url: str) -> str:
-    """
-    Convertit une dataURL (webm/ogg/wav) en WAV mono 16k, retourne le chemin.
-    Nécessite ffmpeg présent (Render: ajouté via apt.txt).
-    """
+    """Transcode dataURL (webm/ogg/wav/m4a/mp4) -> WAV mono 16k via ffmpeg, and return path."""
     if not data_url or not data_url.startswith("data:"):
         raise ValueError("audio dataURL requis")
     header, b64 = data_url.split(",", 1)
@@ -171,20 +152,20 @@ def _decode_dataurl_to_wav_path(data_url: str) -> str:
 
 def _compute_openl3_embedding(wav_path: str) -> List[float]:
     """
-    Calcule un embedding audio OpenL3 (mean-pooling) et renvoie une liste de floats.
+    Compute OpenL3 embedding (mean pooling) avec config mémoire-light.
+    Import d'openl3 (et donc TensorFlow) fait à l'appel.
     """
+    # Lecture audio
     try:
         y, sr = sf.read(wav_path, always_2d=False)
     except Exception as e:
         raise RuntimeError(f"audio read error: {e}")
-    finally:
-        # on supprimera le wav en fin de fonction pour couvrir tous les cas
-        pass
 
     if y is None:
         try: os.remove(wav_path)
         except: pass
         return []
+
     y = np.asarray(y, dtype=np.float32)
     if y.ndim == 2:
         y = np.mean(y, axis=1)
@@ -193,30 +174,41 @@ def _compute_openl3_embedding(wav_path: str) -> List[float]:
         except: pass
         return []
 
+    # Paramètres “safe”
+    input_repr = os.getenv("AUDIO_EMB_INPUT_REPR", "mel128").lower()
+    if input_repr not in ("mel128", "mel256"):
+        input_repr = "mel128"
+    content = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()
+    if content not in ("music", "env"):
+        content = "music"
     try:
+        size = int(os.getenv("AUDIO_EMB_EMBED_SIZE", "512"))
+    except Exception:
+        size = 512
+    if size not in (512, 6144):
+        size = 512
+
+    try:
+        import openl3  # lourd → import paresseux
         emb, _ = openl3.get_audio_embedding(
-            y, sr,
-            input_repr=AUDIO_EMB_INPUT_REPR,
-            content_type=AUDIO_EMB_CONTENT_TYPE,   # "music" | "env"
-            embedding_size=AUDIO_EMB_EMBED_SIZE
+            y, sr, input_repr=input_repr, content_type=content, embedding_size=size
         )
     except Exception as e:
         try: os.remove(wav_path)
         except: pass
         raise RuntimeError(f"openl3 error: {e}")
 
-    if emb is None or not hasattr(emb, "shape") or emb.shape[0] == 0:
+    if emb is None or not getattr(emb, "shape", (0,))[0]:
         try: os.remove(wav_path)
         except: pass
         return []
 
     vec = np.mean(emb, axis=0)
-    vec = np.where(np.isfinite(vec), vec, 0.0).astype(float)
+    vec = np.where(np.isfinite(vec), vec, 0.0).astype(float).tolist()
 
     try: os.remove(wav_path)
     except: pass
-
-    return vec.tolist()
+    return vec
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
@@ -260,7 +252,7 @@ class ChatIn(BaseModel):
     bridge: bool = False
     from_audio: bool = False
     audio: Optional[str] = None   # dataURL audio (pour fallback audio-embed serveur)
-    mfcc: Optional[Dict[str, Any]] = None  # conservé pour compat; ignoré ici
+    mfcc: Optional[Dict[str, Any]] = None
     history: Optional[List[Any]] = None
 
 class CollectIn(BaseModel):
@@ -296,10 +288,6 @@ class NearbyIn(BaseModel):
 def health():
     return {"ok": True}
 
-@app.get("/api/aemb_ping")
-def aemb_ping():
-    return {"ok": True}
-
 # ------------------------- Chat -------------------------
 @app.post("/api/chat")
 def api_chat(inp: ChatIn):
@@ -307,17 +295,15 @@ def api_chat(inp: ChatIn):
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
     user_text = (inp.text or "").strip()
-
-    # langue base pour la table
     base_lang = inp.sourceLang.lower() if inp.sourceLang.lower() != "fr" else inp.targetLang.lower()
     if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}:
         base_lang = "mina"
 
     best_text = None
     best_audioemb = None
-    mfcc_rows = 0  # pour compat debug
+    mfcc_rows = 0
 
-    # 1) Matching TEXTE (OpenAI embedding) → RPC match_audio_meta
+    # 1) Texte → embeddings OpenAI → RPC match_audio_meta
     if user_text and openai_client:
         qvec = embed_text(user_text)
         if qvec:
@@ -335,7 +321,7 @@ def api_chat(inp: ChatIn):
             except Exception as e:
                 print("❌ rpc match error:", e)
 
-    # 2) Fallback AUDIO-EMBEDDING serveur si pas de texte mais audio fourni
+    # 2) Fallback audio-embedding si from_audio et audio fourni
     if inp.from_audio and not user_text and inp.audio and USE_AUDIO_EMB:
         try:
             wav_path = _decode_dataurl_to_wav_path(inp.audio)
@@ -354,7 +340,7 @@ def api_chat(inp: ChatIn):
         except Exception as e:
             print("❌ audio-embed fallback error:", e)
 
-    # 3) Arbitrage final — priorité texte > audio-embed
+    # 3) Arbitrage : priorité texte > audio-embed
     final_hit, via = None, "fallback"
     cand_list = []
     if best_text: cand_list.append(best_text | {"prio": 2})
@@ -364,7 +350,7 @@ def api_chat(inp: ChatIn):
         top = cand_list[0]
         final_hit, via = {"row": top["row"], "score": top["score"]}, top.get("via","")
 
-    # 4) Réponse (fallback explicite)
+    # 4) Réponse
     if not final_hit:
         default_mina = "moudékoukou gnémousséwo"
         out = {"reply": default_mina, "row_id": None}
@@ -378,7 +364,7 @@ def api_chat(inp: ChatIn):
                     "row_id": best_audioemb["row"].get("id"), "score": round(best_audioemb["score"],4)
                 },
                 "mfcc_rows": mfcc_rows, "chosen_row_id": None,
-                "note": "no match → returning default mina phrase"
+                "note": "no match → default mina"
             }
         try:
             supabase.table("server_logs").insert({
@@ -453,15 +439,19 @@ def api_collect(inp: CollectIn):
     if vec:
         row["embedding"] = vec
 
-    # audio_embedding si audio fourni (optionnel)
+    # audio_embedding si audio fourni
+    audio_embedding = None
     if inp.audio and USE_AUDIO_EMB:
         try:
             wav_path = _decode_dataurl_to_wav_path(inp.audio)
             avec = _compute_openl3_embedding(wav_path)
             if avec:
-                row["audio_embedding"] = avec
+                audio_embedding = avec
         except Exception as e:
             print("⚠️ audio_embedding compute error:", e)
+
+    if audio_embedding:
+        row["audio_embedding"] = audio_embedding
 
     res = supabase.table("audio_meta").insert(row).execute()
     if not res.data:
@@ -521,9 +511,9 @@ def api_stt(payload: Dict[str, Any]):
         try: os.remove(tmp_path)
         except: pass
 
-# ------------------------- Audio-embedding direct (outil) -------------------------
+# ------------------------- Audio-embedding direct -------------------------
 @app.post("/api/compute_audio_embedding")
-def api_compute_audio_embedding(payload: dict):
+def api_compute_audio_embedding(payload: Dict[str, Any]):
     if not USE_AUDIO_EMB:
         raise HTTPException(status_code=501, detail="audio-embedding désactivé (set USE_AUDIO_EMB=1)")
     data_url = (payload or {}).get("audio") or ""
