@@ -61,6 +61,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ... imports + clients + app = FastAPI(...) + middleware CORS ...
+
+@app.on_event("startup")
+def _warm_audio_embedding():
+    """
+    Pré-charger le modèle OpenL3 au démarrage pour éviter le first-call lent/timeout.
+    Ne fait rien si USE_AUDIO_EMB != "1".
+    """
+    import os
+    if os.getenv("USE_AUDIO_EMB", "0") != "1":
+        return
+    try:
+        import numpy as np, openl3
+        sr = 16000
+        y  = np.zeros(sr, dtype=np.float32)  # 1 seconde de silence
+
+        # mêmes paramètres que l’endpoint audio
+        input_repr = os.getenv("AUDIO_EMB_INPUT_REPR", "mel256").lower()
+        if input_repr not in ("mel256", "mel128"):
+            input_repr = "mel256"
+
+        content = os.getenv("AUDIO_EMB_CONTENT_TYPE", "music").lower()
+        if content not in ("music", "env"):
+            content = "music"
+
+        try:
+            size = int(os.getenv("AUDIO_EMB_EMBED_SIZE", "512"))
+        except Exception:
+            size = 512
+        if size not in (512, 6144):
+            size = 512
+
+        # premier appel — télécharge/charge le modèle si nécessaire
+        openl3.get_audio_embedding(
+            y, sr,
+            input_repr=input_repr,
+            content_type=content,
+            embedding_size=size
+        )
+        print("✅ OpenL3 warmed")
+    except Exception as e:
+        print("⚠️ OpenL3 warm failed:", e)
+
+
 # Toujours mettre des headers CORS même si exception
 @app.middleware("http")
 async def ensure_cors_headers(request, call_next):
@@ -250,6 +294,10 @@ class NearbyIn(BaseModel):
 # ------------------------- Health -------------------------
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+@app.get("/api/aemb_ping")
+def aemb_ping():
     return {"ok": True}
 
 # ------------------------- Chat -------------------------
