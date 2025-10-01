@@ -6,7 +6,6 @@ from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
 import requests
-import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,16 +13,21 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
+
 # ------------------------- Config & clients -------------------------
 load_dotenv()
 
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
-AUDIO_WORKER_BASE    = os.getenv("AUDIO_WORKER_BASE", "").rstrip("/")
-USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"   # autoriser l’endpoint util /api/compute_audio_embedding
 
-TEXT_SIM_THRESHOLD = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
+# 🟢 UNE SEULE variable worker (uniformisée)
+AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
+
+# Autoriser l’endpoint util /api/compute_audio_embedding (facultatif)
+USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
+
+TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
@@ -64,6 +68,7 @@ async def ensure_cors_headers(request: Request, call_next):
     resp.headers.setdefault("Access-Control-Max-Age", "600")
     return resp
 
+
 # ------------------------- Utils texte -------------------------
 def nk(s: str) -> str:
     t = (s or "").lower()
@@ -79,6 +84,7 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"[^a-z0-9\s]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
@@ -113,27 +119,32 @@ def embed_text(text: str) -> Optional[List[float]]:
         print("❌ embed error (backoff set):", repr(e))
         return None
 
+
 # ------------------------- Audio embedding via Worker -------------------------
-def _compute_audio_embedding_via_worker(data_url: str) -> List[float]:
-    """Appelle le service ‘audio-worker’ (OpenL3) et renvoie le vecteur."""
-    if not AUDIO_WORKER_BASE:
-        print("⚠️ AUDIO_WORKER_BASE manquant — embedding audio désactivé.")
+def _embedding_via_worker(data_url: str) -> List[float]:
+    """
+    Appelle le service ‘audio-worker’ (OpenL3) et renvoie le vecteur.
+    """
+    if not AUDIO_WORKER_URL:
+        print("⚠️ AUDIO_WORKER_URL manquant — embedding audio désactivé.")
         return []
     try:
         r = requests.post(
-            f"{AUDIO_WORKER_BASE}/api/compute_audio_embedding",
+            f"{AUDIO_WORKER_URL}/api/compute_audio_embedding",
             json={"audio": data_url},
             timeout=60
         )
-        if r.ok:
-            j = r.json()
-            return j.get("embedding") or []
-        else:
-            print("audio-worker error:", r.status_code, r.text[:200])
-            return []
+        r.raise_for_status()
+        j = r.json()
+        vec = j.get("embedding") or []
+        return vec if isinstance(vec, list) else []
+    except requests.HTTPError as he:
+        print("audio-worker HTTP error:", getattr(he.response, "status_code", "??"), getattr(he.response, "text", "")[:200])
+        return []
     except Exception as e:
         print("audio-worker exception:", e)
         return []
+
 
 # ------------------------- Schemas -------------------------
 class ChatIn(BaseModel):
@@ -157,7 +168,7 @@ class CollectIn(BaseModel):
     en: Optional[str] = None
     filename: Optional[str] = None
     mime: Optional[str] = None
-    audio: Optional[str] = None        # ignoré côté backend (on ne calcule plus localement)
+    audio: Optional[str] = None        # on ne calcule plus localement
     duration_ms: Optional[int] = None
 
 class LearnIn(BaseModel):
@@ -173,6 +184,7 @@ class NearbyIn(BaseModel):
     lon: float
     radius: int = 4000
 
+
 # ------------------------- Health -------------------------
 @app.get("/health")
 def health():
@@ -180,8 +192,9 @@ def health():
         "ok": True,
         "has_openai": bool(openai_client is not None),
         "has_supabase": bool(supabase is not None),
-        "audio_worker": AUDIO_WORKER_BASE or None
+        "audio_worker": AUDIO_WORKER_URL or None
     }
+
 
 # ------------------------- Chat -------------------------
 @app.post("/api/chat")
@@ -218,7 +231,7 @@ def api_chat(inp: ChatIn):
     # 2) Audio-only → embedding via worker → RPC match_audio_by_vector
     if inp.from_audio and not user_text and inp.audio:
         try:
-            avec = _compute_audio_embedding_via_worker(inp.audio)
+            avec = _embedding_via_worker(inp.audio)
             if avec and supabase:
                 rpc2 = supabase.rpc("match_audio_by_vector", {
                     "p_lang": base_lang,
@@ -299,6 +312,7 @@ def api_chat(inp: ChatIn):
         }
     return out
 
+
 # ------------------------- Collect -------------------------
 @app.post("/api/collect")
 def api_collect(inp: CollectIn):
@@ -316,7 +330,7 @@ def api_collect(inp: CollectIn):
         "filename": (inp.filename or "").strip() or None,
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        # IMPORTANT: on NE calcule PLUS d'embedding audio ici (léger)
+        # IMPORTANT: on NE calcule PLUS d'embedding audio ici
     }
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
@@ -330,6 +344,7 @@ def api_collect(inp: CollectIn):
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert échoué")
     return {"ok": True, "id": res.data[0]["id"]}
+
 
 # ------------------------- Learn -------------------------
 @app.post("/api/learn")
@@ -348,6 +363,7 @@ def api_learn(inp: LearnIn):
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert events échoué")
     return {"ok": True, "inserted": res.data[0]}
+
 
 # ------------------------- STT (Whisper non-streaming) -------------------------
 @app.post("/api/stt")
@@ -383,6 +399,7 @@ def api_stt(payload: Dict[str, Any]):
         try: os.remove(tmp_path)
         except: pass
 
+
 # ------------------------- Audio-embedding util (proxy vers worker) -------------------------
 @app.post("/api/compute_audio_embedding")
 def api_compute_audio_embedding(payload: dict):
@@ -391,10 +408,11 @@ def api_compute_audio_embedding(payload: dict):
     data_url = (payload or {}).get("audio") or ""
     if not (isinstance(data_url, str) and data_url.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
-    vec = _compute_audio_embedding_via_worker(data_url)
+    vec = _embedding_via_worker(data_url)
     if not vec:
         raise HTTPException(status_code=500, detail="embedding vide")
     return {"embedding": vec, "dim": len(vec)}
+
 
 # ------------------------- Nearby (stub) -------------------------
 @app.post("/api/nearby")
