@@ -370,17 +370,34 @@ def api_learn(inp: LearnIn):
 def api_stt(payload: Dict[str, Any]):
     if not openai_client:
         raise HTTPException(status_code=501, detail="STT non configuré (OPENAI_API_KEY manquant)")
+
     data_url = (payload or {}).get("audio") or ""
     if not (isinstance(data_url, str) and data_url.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
-    # decode rapide en fichier temp (webm/ogg/m4a…)
+
+    # 1) séparer header/matière
     try:
         header, b64 = data_url.split(",", 1)
         raw = base64.b64decode(b64)
     except Exception:
         raise HTTPException(status_code=400, detail="audio invalide")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+    # 2) déterminer l’extension d’après le MIME
+    mime = "application/octet-stream"
+    try:
+        m = header.split(";")[0]           # ex: data:audio/webm
+        mime = m.split(":", 1)[1] or mime  # ex: audio/webm
+    except Exception:
+        pass
+
+    ext = ".bin"
+    if "webm" in mime: ext = ".webm"
+    elif "ogg" in mime: ext = ".ogg"
+    elif "mp4" in mime or "m4a" in mime: ext = ".m4a"
+    elif "wav" in mime: ext = ".wav"
+
+    # 3) écrire un fichier temp AVEC une extension reconnue par Whisper
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
         f.write(raw)
         tmp_path = f.name
 
@@ -390,14 +407,15 @@ def api_stt(payload: Dict[str, Any]):
                 model="whisper-1",
                 file=fh
             )
-        text = (tr.text or "").strip()
+        text = (getattr(tr, "text", "") or "").strip()
         return {"text": text}
     except Exception as e:
-        print("❌ STT error:", e)
+        print("❌ STT error:", repr(e))
         raise HTTPException(status_code=500, detail="STT error")
     finally:
         try: os.remove(tmp_path)
         except: pass
+
 
 
 # ------------------------- Audio-embedding util (proxy vers worker) -------------------------
