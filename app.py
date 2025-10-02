@@ -492,6 +492,126 @@ def api_compute_audio_embedding(payload: dict):
     return {"embedding": vec, "dim": len(vec)}
 
 # ------------------------- Nearby (stub) -------------------------
+# ------------------------- Nearby (OSM via Overpass) -------------------------
+import math
+
+OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+OSM_TIMEOUT  = int(os.getenv("OSM_TIMEOUT", "25"))
+NEARBY_LIMIT = int(os.getenv("NEARBY_LIMIT", "20"))
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi   = math.radians(lat2 - lat1)
+    dl     = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+_KIND_QUERIES = {
+    # Pharmacies
+    "pharmacy": [
+        'node["amenity"="pharmacy"]',
+        'way["amenity"="pharmacy"]',
+        'relation["amenity"="pharmacy"]',
+    ],
+    # Hôpitaux / centres
+    "health": [
+        'node["amenity"~"hospital|clinic|doctors"]',
+        'way["amenity"~"hospital|clinic|doctors"]',
+        'relation["amenity"~"hospital|clinic|doctors"]',
+        # tag healthcare générique (souvent mieux rempli en Afrique)
+        'node["healthcare"]',
+        'way["healthcare"]',
+        'relation["healthcare"]',
+    ],
+    # Restauration
+    "food": [
+        'node["amenity"~"restaurant|fast_food|cafe"]',
+        'way["amenity"~"restaurant|fast_food|cafe"]',
+        'relation["amenity"~"restaurant|fast_food|cafe"]',
+    ],
+}
+
+def _build_overpass_ql(kind: str, lat: float, lon: float, radius: int) -> str:
+    parts = _KIND_QUERIES.get(kind, _KIND_QUERIES["pharmacy"])
+    around = f"(around:{max(200, min(radius, 15000))},{lat},{lon})"
+    body = "".join([f"{sel}{around};" for sel in parts])
+    return f"""
+[out:json][timeout:{OSM_TIMEOUT}];
+(
+  {body}
+);
+out center {NEARBY_LIMIT};
+"""
+
+def _extract_element_pos(el: dict):
+    # nodes: lat/lon; ways/relations: center{lat,lon}
+    if "lat" in el and "lon" in el:
+        return float(el["lat"]), float(el["lon"])
+    c = el.get("center")
+    if c and "lat" in c and "lon" in c:
+        return float(c["lat"]), float(c["lon"])
+    return None, None
+
+def _best_name(tags: dict) -> str:
+    if not tags: return ""
+    for k in ("name:fr", "name:en", "name"):
+        if tags.get(k): return tags[k]
+    # fallback sur brand ou healthcare
+    return tags.get("brand") or tags.get("healthcare") or "(sans nom)"
+
+def _addr(tags: dict) -> str:
+    if not tags: return ""
+    bits = []
+    for k in ("addr:street","addr:housenumber","addr:city","addr:district"):
+        if tags.get(k): bits.append(tags[k])
+    return ", ".join(bits)
+
 @app.post("/api/nearby")
 def api_nearby(inp: NearbyIn):
-    return {"items": [], "notice": "Aucun résultat dans ce rayon."}
+    if not (-90 <= inp.lat <= 90 and -180 <= inp.lon <= 180):
+        raise HTTPException(status_code=400, detail="Coordonnées invalides")
+    kind = inp.kind if inp.kind in _KIND_QUERIES else "pharmacy"
+    ql = _build_overpass_ql(kind, inp.lat, inp.lon, inp.radius or 4000)
+
+    try:
+        r = requests.post(OVERPASS_URL, data={"data": ql}, timeout=OSM_TIMEOUT+5)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log_server("nearby_err", {"kind": kind, "error": repr(e)})
+        raise HTTPException(status_code=502, detail="Overpass indisponible")
+
+    items = []
+    for el in data.get("elements", []):
+        lat, lon = _extract_element_pos(el)
+        if lat is None: continue
+        tags = el.get("tags", {}) or {}
+        dist = int(round(_haversine_m(inp.lat, inp.lon, lat, lon)))
+        name = _best_name(tags)
+        addr = _addr(tags)
+        cat  = tags.get("amenity") or tags.get("healthcare") or ""
+        oh   = tags.get("opening_hours") or ""
+        items.append({
+            "name": name,
+            "category": cat,
+            "addr": addr or None,
+            "lat": lat, "lon": lon,
+            "distance_m": dist,
+            "opening_hours": oh or None,
+            "osm_id": f'{el.get("type","node")}/{el.get("id","")}',
+        })
+
+    # tri par distance et limite
+    items.sort(key=lambda x: x["distance_m"])
+    items = items[:NEARBY_LIMIT]
+
+    log_server("nearby_ok", {
+        "kind": kind, "count": len(items),
+        "lat": inp.lat, "lon": inp.lon, "radius": inp.radius
+    })
+    if not items:
+        return {"items": [], "notice": "Aucun résultat trouvé à proximité."}
+
+    return {"items": items}
+
