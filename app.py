@@ -53,6 +53,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# --- CORS preflight explicit (en plus du CORSMiddleware) ---
+from fastapi.responses import Response
+
+@app.options("/{full_path:path}", include_in_schema=False)
+def any_options(full_path: str):
+    resp = Response(status_code=204)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    resp.headers["Access-Control-Max-Age"] = "600"
+    return resp
+
 
 @app.middleware("http")
 async def ensure_cors_headers(request: Request, call_next):
