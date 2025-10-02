@@ -24,10 +24,9 @@ AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-work
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 
 # Seuils (ajustables dans Render)
-TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD",  "0.60"))
-AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.50"))
-AUDIO_SIM_THRESHOLD = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.55"))
-AUDIO_FORCE          = os.getenv("AUDIO_FORCE", "0") == "1"
+TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))  # on durcit le texte
+AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.40"))  # on assouplit l’audio
+HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"        # 1 = on ignore le texte
 
 
 supabase: Optional[Client] = None
@@ -290,24 +289,28 @@ def api_chat(inp: ChatIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
+    # --- Params ---
     user_text = (inp.text or "").strip()
     src_lang  = (inp.sourceLang or "mina").lower()
     tgt_lang  = (inp.targetLang or "fr").lower()
 
-    # langue pivot pour la recherche (inchangé)
     base_lang = src_lang if src_lang != "fr" else tgt_lang
     if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}:
         base_lang = "mina"
 
     best_text = None
-    best_audioemb = None
+    best_audio = None
     audio_candidates_dbg = None
 
-    # 1) TEXTE → embedding OpenAI → match
-    if user_text and openai_client:
-        qvec = embed_text(user_text)
-        if qvec:
-            try:
+    # --- Mode radical: AUDIO ONLY ---
+    if HARD_AUDIO_ONLY:
+        user_text = ""  # on neutralise le texte même si présent
+
+    # 1) (Optionnel) TEXTE → embedding → match (désactivé si HARD_AUDIO_ONLY=1)
+    if user_text and openai_client and not HARD_AUDIO_ONLY:
+        try:
+            qvec = embed_text(user_text)
+            if qvec:
                 rpc = supabase.rpc("match_audio_meta", {
                     "p_lang": base_lang,
                     "p_query": qvec,
@@ -315,18 +318,14 @@ def api_chat(inp: ChatIn):
                 }).execute()
                 cand = rpc.data or []
                 if cand:
-                    best = cand[0]
-                    sim  = 1.0 - float(best.get("distance", 1.0))
-                    best_text = {"row": best, "via": "embed", "score": sim}
-            except Exception as e:
-                print("❌ rpc match (text) error:", e)
+                    b = cand[0]
+                    sim = 1.0 - float(b.get("distance", 1.0))
+                    best_text = {"row": b, "score": sim, "via": "embed"}
+        except Exception as e:
+            print("❌ rpc match (text) error:", e)
 
-    # >>> priorité AUDIO : si audio envoyé, on neutralise tout signal texte
-    if inp.from_audio:
-        best_text = None
-
-    # 2) AUDIO → worker → match
-    if inp.from_audio and (not user_text) and inp.audio:
+    # 2) AUDIO → worker → match (PRIORITAIRE)
+    if (inp.from_audio or HARD_AUDIO_ONLY) and inp.audio:
         try:
             avec = _embedding_via_worker(inp.audio)
             if avec and supabase:
@@ -339,54 +338,33 @@ def api_chat(inp: ChatIn):
                 if cand2:
                     b2   = cand2[0]
                     sim2 = 1.0 - float(b2.get("distance", 1.0))
-                    best_audioemb = {"row": b2, "score": sim2, "via": "audio-embed"}
-                    audio_candidates_dbg = [
-                        {
-                            "row_id":      it.get("id"),
-                            "sim":         round(1.0 - float(it.get("distance", 1.0)), 4),
-                            "text":        (it.get("text") or "").strip(),
-                            "fr":          (it.get("fr") or "").strip(),
-                            "reply_same":  (it.get("reply_same") or "").strip()
-                        } for it in cand2
-                    ]
+                    best_audio = {"row": b2, "score": sim2, "via": "audio-embed"}
+                    # debug
+                    audio_candidates_dbg = [{
+                        "row_id": it.get("id"),
+                        "sim": round(1.0 - float(it.get("distance", 1.0)), 4),
+                        "text": (it.get("text") or "").strip(),
+                        "fr": (it.get("fr") or "").strip(),
+                        "reply_same": (it.get("reply_same") or "").strip(),
+                    } for it in cand2]
         except Exception as e:
             print("❌ audio-embed via worker error:", e)
 
-    # 3) Arbitrage + SEUILS (audio prio) + mode FORCE
+    # 3) Arbitrage — AUDIO > TEXTE (et seuils)
     final_hit, via = None, "fallback"
-    cand_list = []
-    if best_text:     cand_list.append(best_text     | {"prio": 2})
-    if best_audioemb: cand_list.append(best_audioemb | {"prio": 3})
 
-    if cand_list:
-        cand_list.sort(key=lambda x: (x.get("prio",0), x.get("score",0.0)), reverse=True)
-        top = cand_list[0]
-
-        # Si on force l’audio (AUDIO_FORCE=1) et qu’on a un candidat audio, on prend direct
-        if AUDIO_FORCE and top.get("via") == "audio-embed":
-            final_hit, via = {"row": top["row"], "score": top["score"]}, "audio-embed"
-        else:
-            ok = True
-            if   top.get("via") == "embed":
-                ok = (top.get("score", 0.0) >= TEXT_SIM_THRESHOLD)
-            elif top.get("via") == "audio-embed":
-                ok = (top.get("score", 0.0) >= AUDIO_SIM_THRESHOLD)
-
-            if ok:
-                final_hit, via = {"row": top["row"], "score": top["score"]}, top.get("via","")
-            else:
-                try:
-                    supabase.table("server_logs").insert({
-                        "kind": "reject_by_threshold",
-                        "base_lang": base_lang,
-                        "score": float(top.get("score", 0.0)),
-                        "via": top.get("via"),
-                        "threshold_audio": AUDIO_SIM_THRESHOLD,
-                        "threshold_text": TEXT_SIM_THRESHOLD,
-                        "from_audio": bool(inp.from_audio)
-                    }).execute()
-                except Exception:
-                    pass
+    # a) si on a de l’audio et score >= seuil → ON PREND
+    if best_audio and best_audio["score"] >= AUDIO_SIM_THRESHOLD:
+        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
+        via = "audio-embed"
+    # b) si on a de l’audio mais score < seuil… en mode dur on PREND QUAND MÊME (pour débug & casser la régression)
+    elif best_audio and HARD_AUDIO_ONLY:
+        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
+        via = "audio-embed-forced"
+    # c) sinon on tente le texte (seulement si non HARD_AUDIO_ONLY)
+    elif best_text and not HARD_AUDIO_ONLY and best_text["score"] >= TEXT_SIM_THRESHOLD:
+        final_hit = {"row": best_text["row"], "score": best_text["score"]}
+        via = "embed"
 
     # 4) Réponse
     if not final_hit:
@@ -395,24 +373,28 @@ def api_chat(inp: ChatIn):
         if inp.debug:
             out["debug"] = {
                 "from_audio": bool(inp.from_audio),
-                "has_text":   bool(user_text),
+                "has_text": bool(user_text),
                 "via": via,
+                "mode_audio_only": HARD_AUDIO_ONLY,
+                "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+                "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
                 "baseLang": base_lang,
-                "sourceLang": src_lang,
-                "targetLang": tgt_lang,
-                "best_text": None,
-                "best_audio": None,
                 "audio_candidates": audio_candidates_dbg,
-                "input": user_text,
-                "chosen_row_id": None,
+                "best_text": None if not best_text else {
+                    "row_id": best_text["row"].get("id"),
+                    "score": round(best_text["score"], 4)
+                },
+                "best_audio": None if not best_audio else {
+                    "row_id": best_audio["row"].get("id"),
+                    "score": round(best_audio["score"], 4)
+                },
                 "note": "no match → default"
             }
         try:
             supabase.table("server_logs").insert({
                 "kind": "no_match",
-                "input": user_text,
                 "base_lang": base_lang,
-                "meta": {"from_audio": bool(inp.from_audio)},
+                "meta": {"from_audio": bool(inp.from_audio), "audio_only": HARD_AUDIO_ONLY},
                 "debug": json.dumps(out.get("debug", {}))
             }).execute()
         except Exception:
@@ -422,6 +404,7 @@ def api_chat(inp: ChatIn):
     r = final_hit["row"]
     rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
 
+    # mapping réponse (inchangé)
     if inp.mode == "exchange" or tgt_lang == "same":
         reply = rs or tx or fr or en or ""
     else:
@@ -442,19 +425,19 @@ def api_chat(inp: ChatIn):
     if inp.debug:
         out["debug"] = {
             "from_audio": bool(inp.from_audio),
-            "has_text":   bool(user_text),
+            "has_text": bool(user_text),
             "via": via,
+            "mode_audio_only": HARD_AUDIO_ONLY,
+            "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+            "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
             "baseLang": base_lang,
-            "sourceLang": src_lang,
-            "targetLang": tgt_lang,
-            "text_best": None if not best_text else {
+            "best_text": None if not best_text else {
                 "row_id": best_text["row"].get("id"),
-                "via": best_text["via"],
                 "score": round(best_text["score"],4)
             },
-            "best_audio": None if not best_audioemb else {
-                "row_id": best_audioemb["row"].get("id"),
-                "score": round(best_audioemb["score"],4)
+            "best_audio": None if not best_audio else {
+                "row_id": best_audio["row"].get("id"),
+                "score": round(best_audio["score"],4)
             },
             "audio_candidates": audio_candidates_dbg,
             "chosen_row_id": r.get("id")
