@@ -27,7 +27,7 @@ USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD",  "0.60"))
 AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.50"))
 AUDIO_SIM_THRESHOLD = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.55"))
-
+AUDIO_FORCE          = os.getenv("AUDIO_FORCE", "0") == "1"
 
 
 supabase: Optional[Client] = None
@@ -95,6 +95,21 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"[^a-z0-9\s]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+@app.get("/warmup")
+def warmup():
+    return {"ok": True}
+
+@app.get("/health_plus")
+def health_plus():
+    return {
+        "ok": True,
+        "has_openai": bool(openai_client is not None),
+        "has_supabase": bool(supabase is not None),
+        "audio_worker": AUDIO_WORKER_URL or None,
+        "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
+        "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+        "AUDIO_FORCE": AUDIO_FORCE,
+    }
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
@@ -268,9 +283,7 @@ def api_warmup():
     return {"ok": True}
 
 # ------------------------- Chat -------------------------
-# En haut du fichier, avec tes autres env:
-TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.60"))
-AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.50"))
+
 
 @app.post("/api/chat")
 def api_chat(inp: ChatIn):
@@ -281,6 +294,7 @@ def api_chat(inp: ChatIn):
     src_lang  = (inp.sourceLang or "mina").lower()
     tgt_lang  = (inp.targetLang or "fr").lower()
 
+    # langue pivot pour la recherche (inchangé)
     base_lang = src_lang if src_lang != "fr" else tgt_lang
     if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}:
         base_lang = "mina"
@@ -307,11 +321,11 @@ def api_chat(inp: ChatIn):
             except Exception as e:
                 print("❌ rpc match (text) error:", e)
 
-    # >>> PRIORITÉ AUDIO : si audio envoyé, on neutralise tout signal texte
+    # >>> priorité AUDIO : si audio envoyé, on neutralise tout signal texte
     if inp.from_audio:
         best_text = None
 
-    # 2) AUDIO-ONLY → worker → match
+    # 2) AUDIO → worker → match
     if inp.from_audio and (not user_text) and inp.audio:
         try:
             avec = _embedding_via_worker(inp.audio)
@@ -338,7 +352,7 @@ def api_chat(inp: ChatIn):
         except Exception as e:
             print("❌ audio-embed via worker error:", e)
 
-    # 3) Arbitrage + SEUILS (audio prio)
+    # 3) Arbitrage + SEUILS (audio prio) + mode FORCE
     final_hit, via = None, "fallback"
     cand_list = []
     if best_text:     cand_list.append(best_text     | {"prio": 2})
@@ -347,27 +361,32 @@ def api_chat(inp: ChatIn):
     if cand_list:
         cand_list.sort(key=lambda x: (x.get("prio",0), x.get("score",0.0)), reverse=True)
         top = cand_list[0]
-        ok = True
-        if   top.get("via") == "embed":
-            ok = (top.get("score", 0.0) >= TEXT_SIM_THRESHOLD)
-        elif top.get("via") == "audio-embed":
-            ok = (top.get("score", 0.0) >= AUDIO_SIM_THRESHOLD)
 
-        if ok:
-            final_hit, via = {"row": top["row"], "score": top["score"]}, top.get("via","")
+        # Si on force l’audio (AUDIO_FORCE=1) et qu’on a un candidat audio, on prend direct
+        if AUDIO_FORCE and top.get("via") == "audio-embed":
+            final_hit, via = {"row": top["row"], "score": top["score"]}, "audio-embed"
         else:
-            try:
-                supabase.table("server_logs").insert({
-                    "kind": "reject_by_threshold",
-                    "base_lang": base_lang,
-                    "score": float(top.get("score", 0.0)),
-                    "via": top.get("via"),
-                    "threshold_audio": AUDIO_SIM_THRESHOLD,
-                    "threshold_text": TEXT_SIM_THRESHOLD,
-                    "from_audio": bool(inp.from_audio)
-                }).execute()
-            except Exception:
-                pass
+            ok = True
+            if   top.get("via") == "embed":
+                ok = (top.get("score", 0.0) >= TEXT_SIM_THRESHOLD)
+            elif top.get("via") == "audio-embed":
+                ok = (top.get("score", 0.0) >= AUDIO_SIM_THRESHOLD)
+
+            if ok:
+                final_hit, via = {"row": top["row"], "score": top["score"]}, top.get("via","")
+            else:
+                try:
+                    supabase.table("server_logs").insert({
+                        "kind": "reject_by_threshold",
+                        "base_lang": base_lang,
+                        "score": float(top.get("score", 0.0)),
+                        "via": top.get("via"),
+                        "threshold_audio": AUDIO_SIM_THRESHOLD,
+                        "threshold_text": TEXT_SIM_THRESHOLD,
+                        "from_audio": bool(inp.from_audio)
+                    }).execute()
+                except Exception:
+                    pass
 
     # 4) Réponse
     if not final_hit:
