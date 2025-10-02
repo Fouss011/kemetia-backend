@@ -26,6 +26,8 @@ USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 # Seuils (ajustables dans Render)
 TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD",  "0.62"))
 AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.62"))
+AUDIO_SIM_THRESHOLD = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.55"))
+
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
@@ -183,6 +185,61 @@ def health():
         "audio_worker": AUDIO_WORKER_URL or None
     }
 
+@app.get("/warmup")
+def warmup():
+    """
+    Réveille le worker + précharge OpenL3 avec un son silencieux.
+    """
+    try:
+        # petit WAV silencieux base64 (16k mono ~200ms)
+        import struct, base64
+        sr = 16000
+        samples = int(0.2 * sr)
+        # header WAV
+        header = b"RIFF" + struct.pack("<I", 36 + samples*2) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr*2, 2, 16) + b"data" + struct.pack("<I", samples*2)
+        data = b"\x00" * (samples*2)
+        wav = header + data
+        b64 = base64.b64encode(wav).decode("ascii")
+        data_url = f"data:audio/wav;base64,{b64}"
+
+        # Proxy compute → worker (ça réveille l’instance)
+        _ = _embedding_via_worker(data_url)
+
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+class DebugAudioIn(BaseModel):
+    audio: str
+    lang: str = "mina"
+    limit: int = 5
+
+@app.post("/api/debug_audio_match")
+def api_debug_audio_match(inp: DebugAudioIn):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    if not (isinstance(inp.audio, str) and inp.audio.startswith("data:")):
+        raise HTTPException(status_code=400, detail="audio dataURL requis")
+
+    avec = _embedding_via_worker(inp.audio)
+    if not avec:
+        raise HTTPException(status_code=500, detail="embedding vide (worker)")
+
+    try:
+        rpc = supabase.rpc("match_audio_by_vector", {
+            "p_lang": inp.lang.lower(),
+            "p_query": avec,
+            "p_limit": max(1, min(inp.limit, 20))
+        }).execute()
+        rows = rpc.data or []
+        # ajoute sim = 1 - distance
+        for r in rows:
+            r["sim"] = 1.0 - float(r.get("distance", 1.0))
+        return {"candidates": rows[:inp.limit]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"rpc error: {e}")
+
 @app.get("/api/warmup")
 def api_warmup():
     try:
@@ -230,7 +287,8 @@ def api_chat(inp: ChatIn):
             except Exception as e:
                 print("❌ rpc match (text) error:", e)
 
-    # 2) Audio-only → worker → match
+        # 2) Audio-only → embedding via worker → RPC match_audio_by_vector
+    audio_candidates = []
     if inp.from_audio and not user_text and inp.audio:
         try:
             avec = _embedding_via_worker(inp.audio)
@@ -241,19 +299,23 @@ def api_chat(inp: ChatIn):
                     "p_limit": 5
                 }).execute()
                 cand2 = rpc2.data or []
-                if cand2:
-                    b2 = cand2[0]
-                    sim2 = 1.0 - float(b2.get("distance", 1.0))
-                    if sim2 >= AUDIO_SIM_THRESHOLD:
-                        best_audioemb = {"row": b2, "score": sim2, "via": "audio-embed"}
+                for c in cand2:
+                    sim2 = 1.0 - float(c.get("distance", 1.0))
+                    audio_candidates.append({"row": c, "score": sim2, "via": "audio-embed"})
+                # filtre par seuil audio
+                audio_candidates = [x for x in audio_candidates if x["score"] >= AUDIO_SIM_THRESHOLD]
+                if audio_candidates:
+                    audio_candidates.sort(key=lambda x: x["score"], reverse=True)
+                    best_audioemb = audio_candidates[0]
         except Exception as e:
             print("❌ audio-embed via worker error:", e)
 
     # 3) Arbitrage final — priorité texte > audio-embed
     final_hit, via = None, "fallback"
     cand_list = []
-    if best_text: cand_list.append(best_text | {"prio": 2})
+    if best_text:     cand_list.append(best_text | {"prio": 2})
     if best_audioemb: cand_list.append(best_audioemb | {"prio": 1})
+
     if cand_list:
         cand_list.sort(key=lambda x: (x.get("prio",0), x.get("score",0)), reverse=True)
         top = cand_list[0]
@@ -267,17 +329,27 @@ def api_chat(inp: ChatIn):
             out["debug"] = {
                 "from_audio": bool(inp.from_audio),
                 "has_text": bool(user_text),
-                "via": via, "baseLang": base_lang,
-                "sourceLang": inp.sourceLang, "targetLang": inp.targetLang,
+                "via": "fallback",
+                "baseLang": base_lang,
+                "sourceLang": (inp.sourceLang or "").lower(),
+                "targetLang": (inp.targetLang or "").lower(),
                 "best_text": None if not best_text else {
-                    "row_id": best_text["row"].get("id"), "score": round(best_text["score"],4)
+                    "row_id": best_text["row"].get("id"),
+                    "score": round(best_text["score"],4),
                 },
                 "best_audio": None if not best_audioemb else {
-                    "row_id": best_audioemb["row"].get("id"), "score": round(best_audioemb["score"],4)
+                    "row_id": best_audioemb["row"].get("id"),
+                    "score": round(best_audioemb["score"],4),
                 },
                 "input": user_text,
                 "chosen_row_id": None,
-                "note": "no match → default"
+                "note": "no match → default",
+                "audio_threshold": AUDIO_SIM_THRESHOLD,
+                "text_threshold": TEXT_SIM_THRESHOLD,
+                "audio_candidates": [
+                    {"row_id": x["row"].get("id"), "score": round(x["score"],4)}
+                    for x in audio_candidates
+                ] if (inp.debug and audio_candidates) else []
             }
         try:
             supabase.table("server_logs").insert({
@@ -289,6 +361,7 @@ def api_chat(inp: ChatIn):
         except Exception:
             pass
         return out
+
 
     r = final_hit["row"]
     rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
