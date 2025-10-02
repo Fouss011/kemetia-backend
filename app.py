@@ -1,9 +1,9 @@
-# app.py — FastAPI (Texte via OpenAI + STT Whisper + audio-embedding délégué au worker)
+# app.py — FastAPI (Texte via OpenAI + STT Whisper + audio-embedding délégué au worker + upload Supabase)
 from __future__ import annotations
-
 import os, re, json, base64, tempfile, unicodedata, time
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
+from uuid import uuid4
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-
 # ------------------------- Config & clients -------------------------
 load_dotenv()
 
@@ -21,13 +20,10 @@ SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 
-# 🟢 UNE SEULE variable worker (uniformisée)
 AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
-
-# Autoriser l’endpoint util /api/compute_audio_embedding (facultatif)
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
-
 TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.68"))
+STORAGE_BUCKET       = os.getenv("STORAGE_BUCKET", "kemetia-audio")  # public
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
@@ -43,9 +39,9 @@ if OPENAI_API_KEY:
     except Exception as e:
         print("❌ OpenAI init error:", e)
 
-app = FastAPI(title="Kemetia Backend (light)")
+app = FastAPI(title="Kemetia Backend")
 
-# CORS permissif + ensure headers même en cas d’exception
+# CORS permissif
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,15 +57,13 @@ async def ensure_cors_headers(request: Request, call_next):
     except Exception as e:
         from fastapi.responses import JSONResponse
         resp = JSONResponse({"detail": "server error", "error": str(e)}, status_code=500)
-    # Garantir les en-têtes CORS
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
     resp.headers.setdefault("Access-Control-Max-Age", "600")
     return resp
 
-
-# ------------------------- Utils texte -------------------------
+# ------------------------- Utils -------------------------
 def nk(s: str) -> str:
     t = (s or "").lower()
     t = unicodedata.normalize("NFD", t)
@@ -85,6 +79,15 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def log_server(kind: str, data: dict):
+    if supabase is None: return
+    try:
+        supabase.table("server_logs").insert({
+            "kind": kind,
+            "debug": json.dumps(data, ensure_ascii=False),
+        }).execute()
+    except Exception as e:
+        print("log_server error:", e)
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
@@ -111,7 +114,6 @@ def embed_text(text: str) -> Optional[List[float]]:
         return list(vec_tuple)
     except Exception as e:
         s = str(e) or ""
-        # backoff simple
         if "RateLimit" in s or "quota" in s.lower() or "429" in s:
             EMBED_FAIL_UNTIL = time.time() + 120
         else:
@@ -119,14 +121,10 @@ def embed_text(text: str) -> Optional[List[float]]:
         print("❌ embed error (backoff set):", repr(e))
         return None
 
-
 # ------------------------- Audio embedding via Worker -------------------------
 def _embedding_via_worker(data_url: str) -> List[float]:
-    """
-    Appelle le service ‘audio-worker’ (OpenL3) et renvoie le vecteur.
-    """
-    if not AUDIO_WORKER_URL:
-        print("⚠️ AUDIO_WORKER_URL manquant — embedding audio désactivé.")
+    if not (AUDIO_WORKER_URL and USE_AUDIO_EMB):
+        print("⚠️ AUDIO_WORKER_URL/USE_AUDIO_EMB manquant — embedding audio désactivé.")
         return []
     try:
         r = requests.post(
@@ -145,6 +143,34 @@ def _embedding_via_worker(data_url: str) -> List[float]:
         print("audio-worker exception:", e)
         return []
 
+def _supabase_upload_dataurl(data_url: str, lang: str = "mina") -> dict:
+    """Upload un dataURL audio vers Supabase Storage (bucket public)."""
+    if supabase is None: return {}
+    if not (isinstance(data_url, str) and data_url.startswith("data:")):
+        return {}
+    try:
+        header, b64 = data_url.split(",", 1)
+        mime = header.split(";")[0].split(":", 1)[1] or "application/octet-stream"
+        raw = base64.b64decode(b64)
+    except Exception:
+        return {}
+
+    ext = ".bin"
+    if "webm" in mime: ext = ".webm"
+    elif "ogg" in mime: ext = ".ogg"
+    elif "mp4" in mime or "m4a" in mime: ext = ".m4a"
+    elif "wav" in mime: ext = ".wav"
+
+    folder = time.strftime("%Y%m")
+    filename = f"{uuid4().hex}{ext}"
+    path = f"audio/{lang}/{folder}/{filename}"
+    try:
+        supabase.storage.from_(STORAGE_BUCKET).upload(path, raw, {"content-type": mime, "upsert": True})
+        public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(path)
+        return {"url": public_url, "path": path, "mime": mime, "bytes": len(raw)}
+    except Exception as e:
+        print("❌ storage upload error:", e)
+        return {}
 
 # ------------------------- Schemas -------------------------
 class ChatIn(BaseModel):
@@ -155,7 +181,7 @@ class ChatIn(BaseModel):
     debug: bool = True
     bridge: bool = False
     from_audio: bool = False
-    audio: Optional[str] = None     # dataURL audio si from_audio
+    audio: Optional[str] = None
     history: Optional[List[Any]] = None
 
 class CollectIn(BaseModel):
@@ -168,8 +194,9 @@ class CollectIn(BaseModel):
     en: Optional[str] = None
     filename: Optional[str] = None
     mime: Optional[str] = None
-    audio: Optional[str] = None        # on ne calcule plus localement
+    audio: Optional[str] = None        # <= dataURL
     duration_ms: Optional[int] = None
+    mfcc: Optional[dict] = None        # trace optionnelle
 
 class LearnIn(BaseModel):
     row_id: int
@@ -184,7 +211,6 @@ class NearbyIn(BaseModel):
     lon: float
     radius: int = 4000
 
-
 # ------------------------- Health -------------------------
 @app.get("/health")
 def health():
@@ -194,7 +220,6 @@ def health():
         "has_supabase": bool(supabase is not None),
         "audio_worker": AUDIO_WORKER_URL or None
     }
-
 
 # ------------------------- Chat -------------------------
 @app.post("/api/chat")
@@ -256,25 +281,40 @@ def api_chat(inp: ChatIn):
         top = cand_list[0]
         final_hit, via = {"row": top["row"], "score": top["score"]}, top.get("via","")
 
-    # 4) Réponse
+    # 4) Logging
+    dbg = {
+        "from_audio": bool(inp.from_audio),
+        "has_text": bool(user_text),
+        "via": via,
+        "baseLang": base_lang,
+        "sourceLang": inp.sourceLang,
+        "targetLang": inp.targetLang,
+        "best_text": None if not best_text else {
+            "row_id": best_text["row"].get("id"),
+            "score": round(best_text["score"], 4)
+        },
+        "best_audio": None if not best_audioemb else {
+            "row_id": best_audioemb["row"].get("id"),
+            "score": round(best_audioemb["score"], 4)
+        },
+    }
+
+    # 5) Réponse
     if not final_hit:
         default_mina = "moudékoukou gnémousséwo"
         out = {"reply": default_mina, "row_id": None}
         if inp.debug:
-            out["debug"] = {
-                "input": user_text, "baseLang": base_lang, "via": via,
-                "text_best": None, "audio_best": None,
-                "chosen_row_id": None, "note": "no match → default"
-            }
+            out["debug"] = dbg | {"input": user_text, "chosen_row_id": None, "note": "no match → default"}
         try:
             supabase.table("server_logs").insert({
                 "kind": "no_match",
                 "input": user_text,
                 "base_lang": base_lang,
-                "debug": json.dumps(out.get("debug", {}))
+                "debug": json.dumps(out.get("debug", {}), ensure_ascii=False)
             }).execute()
         except Exception:
             pass
+        log_server("chat_no_match", dbg | {"input_preview": user_text[:80]})
         return out
 
     r = final_hit["row"]
@@ -300,18 +340,12 @@ def api_chat(inp: ChatIn):
 
     out = {"reply": reply, "row_id": r.get("id")}
     if inp.debug:
-        out["debug"] = {
-            "input": user_text, "baseLang": base_lang, "via": via,
-            "text_best": None if not best_text else {
-                "row_id": best_text["row"].get("id"), "via": best_text["via"], "score": round(best_text["score"],4)
-            },
-            "audio_best": None if not best_audioemb else {
-                "row_id": best_audioemb["row"].get("id"), "score": round(best_audioemb["score"],4)
-            },
-            "chosen_row_id": r.get("id")
-        }
+        out["debug"] = dbg | {"input": user_text, "chosen_row_id": r.get("id")}
+    log_server("chat_match", dbg | {
+        "chosen_row_id": r.get("id"),
+        "reply_preview": reply[:80]
+    })
     return out
-
 
 # ------------------------- Collect -------------------------
 @app.post("/api/collect")
@@ -330,7 +364,7 @@ def api_collect(inp: CollectIn):
         "filename": (inp.filename or "").strip() or None,
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        # IMPORTANT: on NE calcule PLUS d'embedding audio ici
+        "mfcc": inp.mfcc or None,  # trace optionnelle
     }
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
@@ -340,11 +374,38 @@ def api_collect(inp: CollectIn):
     if vec:
         row["embedding"] = vec
 
+    # Si audio : (1) embedding via worker, (2) upload Storage
+    audio_embedding = None
+    file_info = {}
+    if inp.audio:
+        try:
+            avec = _embedding_via_worker(inp.audio)
+            if avec:
+                audio_embedding = avec
+        except Exception as e:
+            print("❌ audio-embed via worker (collect) error:", e)
+
+        file_info = _supabase_upload_dataurl(inp.audio, row["lang"] or "mina")
+        if file_info.get("url"):
+            row["url"] = file_info["url"]
+            row["mime"] = file_info.get("mime") or row["mime"]
+
+    if audio_embedding:
+        row["audio_embedding"] = audio_embedding
+
     res = supabase.table("audio_meta").insert(row).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert échoué")
-    return {"ok": True, "id": res.data[0]["id"]}
 
+    log_server("collect_insert", {
+        "id": res.data[0]["id"],
+        "lang": row["lang"],
+        "has_audio": bool(inp.audio),
+        "has_text_emb": bool(vec),
+        "has_audio_emb": bool(audio_embedding),
+        "url": row.get("url")
+    })
+    return {"ok": True, "id": res.data[0]["id"]}
 
 # ------------------------- Learn -------------------------
 @app.post("/api/learn")
@@ -364,7 +425,6 @@ def api_learn(inp: LearnIn):
         raise HTTPException(status_code=500, detail="Insert events échoué")
     return {"ok": True, "inserted": res.data[0]}
 
-
 # ------------------------- STT (Whisper non-streaming) -------------------------
 @app.post("/api/stt")
 def api_stt(payload: Dict[str, Any]):
@@ -375,20 +435,17 @@ def api_stt(payload: Dict[str, Any]):
     if not (isinstance(data_url, str) and data_url.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
 
-    # 1) séparer header/matière
+    # parse header pour mime + size_kb
+    size_kb = 0
+    mime = "application/octet-stream"
     try:
         header, b64 = data_url.split(",", 1)
         raw = base64.b64decode(b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="audio invalide")
-
-    # 2) déterminer l’extension d’après le MIME
-    mime = "application/octet-stream"
-    try:
+        size_kb = int(len(raw) / 1024)
         m = header.split(";")[0]           # ex: data:audio/webm
         mime = m.split(":", 1)[1] or mime  # ex: audio/webm
     except Exception:
-        pass
+        raise HTTPException(status_code=400, detail="audio invalide")
 
     ext = ".bin"
     if "webm" in mime: ext = ".webm"
@@ -396,7 +453,6 @@ def api_stt(payload: Dict[str, Any]):
     elif "mp4" in mime or "m4a" in mime: ext = ".m4a"
     elif "wav" in mime: ext = ".wav"
 
-    # 3) écrire un fichier temp AVEC une extension reconnue par Whisper
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
         f.write(raw)
         tmp_path = f.name
@@ -408,15 +464,19 @@ def api_stt(payload: Dict[str, Any]):
                 file=fh
             )
         text = (getattr(tr, "text", "") or "").strip()
+
+        log_server("stt_ok", {
+            "mime": mime, "size_kb": size_kb,
+            "text_len": len(text), "preview": text[:80]
+        })
         return {"text": text}
     except Exception as e:
         print("❌ STT error:", repr(e))
+        log_server("stt_err", {"mime": mime, "size_kb": size_kb, "error": repr(e)})
         raise HTTPException(status_code=500, detail="STT error")
     finally:
         try: os.remove(tmp_path)
         except: pass
-
-
 
 # ------------------------- Audio-embedding util (proxy vers worker) -------------------------
 @app.post("/api/compute_audio_embedding")
@@ -430,7 +490,6 @@ def api_compute_audio_embedding(payload: dict):
     if not vec:
         raise HTTPException(status_code=500, detail="embedding vide")
     return {"embedding": vec, "dim": len(vec)}
-
 
 # ------------------------- Nearby (stub) -------------------------
 @app.post("/api/nearby")
