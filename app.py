@@ -111,7 +111,7 @@ def health_plus():
 @app.get("/warmup")
 def warmup():
     return {"ok": True}
-
+    
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
 EMBED_FAIL_UNTIL = 0.0
@@ -448,33 +448,100 @@ def api_chat(inp: ChatIn):
 
 
 # ------------------------- Collect -------------------------
+# ------------------------- Collect (insert + embeddings) -------------------------
 @app.post("/api/collect")
 def api_collect(inp: CollectIn):
+    """
+    Insère une ligne dans la table (par défaut 'audio_meta') en remplissant :
+      - text/variants/reply_same/fr/en/mime/filename/category/lang ...
+      - signatures: sig, sig_ns, variants_text, variants_sig
+      - embedding (texte, OpenAI)
+      - audio_embedding (512, via worker) si 'audio' (dataURL) présent
+      - flags: embedding_generated, is_enabled
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    row = {
-        "lang": (inp.lang or "").lower(),
-        "category": (inp.category or "").strip() or None,
-        "text": (inp.text or "").strip(),
-        "variants_text": (inp.variants or "").strip() or None,
-        "reply_same": (inp.reply_same or "").strip() or None,
-        "fr": (inp.fr or "").strip() or None,
-        "en": (inp.en or "").strip() or None,
-        "filename": (inp.filename or "").strip() or None,
-        "mime": (inp.mime or "").strip() or None,
-        "duration_ms": inp.duration_ms,
-    }
-    if not row["text"]:
+    # --- 1) Normalisation de base ---
+    lang       = (inp.lang or "").lower()
+    category   = (inp.category or "").strip() or None
+    text       = (inp.text or "").strip()
+    variants   = (inp.variants or "").strip() or None
+    reply_same = (inp.reply_same or "").strip() or None
+    fr         = (inp.fr or "").strip() or None
+    en         = (inp.en or "").strip() or None
+    filename   = (inp.filename or "").strip() or None
+    mime       = (inp.mime or "").strip() or None
+    duration   = inp.duration_ms
+
+    if not text:
         raise HTTPException(status_code=400, detail="text obligatoire")
 
-    vec = embed_text(row["text"])
-    if vec:
-        row["embedding"] = vec
+    # signatures (pour tes colonnes existantes)
+    sig_ns  = nk(text)                 # normalisé « soft » (sans accents)
+    sig     = soft_canon(text)         # encore plus canonique (alphanum)
+    vtext   = variants or None
+    vsig    = soft_canon(variants) if variants else None
 
-    res = supabase.table("audio_meta").insert(row).execute()
+    # --- 2) Embedding texte (OpenAI) -> 'embedding'
+    row = {
+        "lang":          lang,
+        "category":      category,
+        "text":          text,
+        "variants_text": vtext,
+        "variants_sig":  vsig,
+        "reply_same":    reply_same,
+        "fr":            fr,
+        "en":            en,
+        "filename":      filename,
+        "mime":          mime,
+        "duration_ms":   duration,
+        "sig":           sig,
+        "sig_ns":        sig_ns,
+        "is_enabled":    True,              # actif par défaut
+        "embedding_generated": False,       # on passera à True si calculé
+        # champs que tu as dans le schéma mais qu'on ne remplit pas ici :
+        "fsm_expect":    None,
+        "fsm_maybe_id":  None,
+        "fsm_next_id":   None,
+        "fsm_no_id":     None,
+        "fsm_options":   None,
+        "fsm_yes_id":    None,
+        "path":          None,
+        "url":           None,
+        "storage_path":  None,
+        "mfcc":          None,              # tu peux l'alimenter depuis le front si tu veux
+        # "audio":       None,              # si tu veux stocker le dataURL brut (déconseillé)
+    }
+
+    # Embedding texte
+    try:
+        vec = embed_text(text)
+        if vec:
+            row["embedding"] = vec
+            row["embedding_generated"] = True
+    except Exception as e:
+        print("collect: embed_text error:", e)
+
+    # --- 3) Embedding audio (via worker) -> 'audio_embedding'
+    # (uniquement si l'appel front nous a passé un dataURL 'audio')
+    if isinstance(inp.audio, str) and inp.audio.startswith("data:"):
+        try:
+            avec = _embedding_via_worker(inp.audio)
+            if avec:
+                row["audio_embedding"] = avec   # vector(512)
+        except Exception as e:
+            print("collect: audio worker error:", e)
+
+    # --- 4) INSERT ---
+    try:
+        res = supabase.table("audio_meta").insert(row).execute()  # <-- adapte le nom si besoin
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insert échoué: {e}")
+
     if not res.data:
-        raise HTTPException(status_code=500, detail="Insert échoué")
+        raise HTTPException(status_code=500, detail="Insert vide")
+
     return {"ok": True, "id": res.data[0]["id"]}
 
 # ------------------------- Learn -------------------------
