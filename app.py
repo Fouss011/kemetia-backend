@@ -26,6 +26,9 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 
+from datetime import datetime  # si pas déjà importé
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
 # Seuils — ajustables dans Render
 TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))  # texte durci
 AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.60"))  # audio plus strict
@@ -244,6 +247,41 @@ class NearbyIn(BaseModel):
     lat: float
     lon: float
     radius: int = 4000
+
+class EventsQuery(BaseModel):
+    city: Optional[str] = None
+    date_from: Optional[str] = None  # "2025-10-03"
+    date_to: Optional[str] = None
+    q: Optional[str] = None
+    limit: int = 50
+
+class EventSubmitIn(BaseModel):
+    title: str
+    title_mina: Optional[str] = None
+    description: Optional[str] = None
+    description_mina: Optional[str] = None
+    city: Optional[str] = None
+    venue_name: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    start_time: str  # ex "2025-10-03 19:00"
+    end_time: Optional[str] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    currency: Optional[str] = "XOF"
+    tags: Optional[List[str]] = None
+    cover_url: Optional[str] = None
+    website: Optional[str] = None
+    phone: Optional[str] = None
+    submitter_name: Optional[str] = None
+    submitter_email: Optional[str] = None
+
+class EventReviewIn(BaseModel):
+    id: int
+    action: str               # "approve" | "reject"
+    reason: Optional[str] = None
+    admin_token: str
+
 
 class DebugAudioIn(BaseModel):
     audio: str
@@ -683,6 +721,113 @@ def api_nearby(inp: NearbyIn):
     if not items:
         return {"items": [], "notice": "Aucun résultat dans ce rayon."}
     return {"items": items[:25]}
+
+@app.post("/api/events")
+def api_events(q: EventsQuery):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    try:
+        s = supabase.from_("events").select("*").eq("is_published", True)
+        if q.city:
+            s = s.ilike("city", f"%{q.city}%")
+        if q.date_from:
+            s = s.gte("start_time", q.date_from)
+        if q.date_to:
+            s = s.lte("start_time", q.date_to + " 23:59:59")
+        if q.q:
+            s = s.or_(f"title.ilike.%{q.q}%,description.ilike.%{q.q}%")
+        s = s.order("start_time", desc=False).limit(max(1, min(q.limit, 200)))
+        data = s.execute().data or []
+        return {"items": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"events error: {e}")
+
+@app.get("/api/event/{eid}")
+def api_event(eid: int):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    r = supabase.from_("events").select("*").eq("id", eid).single().execute()
+    if not r.data:
+        raise HTTPException(status_code=404, detail="not found")
+    return r.data
+
+@app.post("/api/event_submit")
+def api_event_submit(inp: EventSubmitIn):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    if not inp.title or not inp.start_time:
+        raise HTTPException(status_code=400, detail="title et start_time requis")
+
+    row = inp.model_dump()
+    if row.get("tags") and not isinstance(row["tags"], list):
+        row["tags"] = [str(row["tags"])]
+
+    r = supabase.table("event_submissions").insert(row).execute()
+    if not r.data:
+        raise HTTPException(status_code=500, detail="insert submission failed")
+    return {"ok": True, "id": r.data[0]["id"]}
+
+@app.post("/api/event_submissions")
+def api_event_submissions(payload: Dict[str, Any]):
+    if (payload or {}).get("admin_token") != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="unauthorized")
+
+    status = (payload or {}).get("status") or "pending"
+    limit  = int((payload or {}).get("limit") or 100)
+    try:
+        s = supabase.from_("event_submissions").select("*").eq("status", status)\
+            .order("created_at", desc=True).limit(min(limit, 200))
+        data = s.execute().data or []
+        return {"items": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"list submissions error: {e}")
+
+@app.post("/api/event_review")
+def api_event_review(inp: EventReviewIn):
+    if inp.admin_token != ADMIN_TOKEN or not ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="unauthorized")
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    sub = supabase.from_("event_submissions").select("*").eq("id", inp.id).single().execute().data
+    if not sub:
+        raise HTTPException(status_code=404, detail="submission not found")
+
+    if inp.action == "reject":
+        supabase.table("event_submissions").update({
+            "status": "rejected", "reason": inp.reason or "rejected"
+        }).eq("id", inp.id).execute()
+        return {"ok": True, "status": "rejected"}
+
+    if inp.action == "approve":
+        ev = {
+            "title": sub.get("title"),
+            "title_mina": sub.get("title_mina"),
+            "description": sub.get("description"),
+            "description_mina": sub.get("description_mina"),
+            "city": sub.get("city"),
+            "venue_name": sub.get("venue_name"),
+            "lat": sub.get("lat"),
+            "lon": sub.get("lon"),
+            "start_time": sub.get("start_time"),
+            "end_time": sub.get("end_time"),
+            "price_min": sub.get("price_min"),
+            "price_max": sub.get("price_max"),
+            "currency": sub.get("currency") or "XOF",
+            "tags": sub.get("tags"),
+            "cover_url": sub.get("cover_url"),
+            "website": sub.get("website"),
+            "phone": sub.get("phone"),
+            "is_published": True
+        }
+        ins = supabase.table("events").insert(ev).execute()
+        if not ins.data:
+            raise HTTPException(status_code=500, detail="insert event failed")
+        supabase.table("event_submissions").update({"status":"approved"}).eq("id", inp.id).execute()
+        return {"ok": True, "status": "approved", "event_id": ins.data[0]["id"]}
+
+    raise HTTPException(status_code=400, detail="action inconnue")
 
 # ------------------------------------------------------------------
 # Proxy compute embedding (utile pour diag)
