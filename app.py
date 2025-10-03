@@ -1,64 +1,48 @@
-# app.py — FastAPI (Kemetia) — audio-first + seuil+marge
+# app.py — Kemetia (FastAPI)
 from __future__ import annotations
-
-import os, re, json, base64, tempfile, unicodedata, time, math, struct
+import os, re, json, base64, tempfile, unicodedata, time, math
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
+# ------------------------- Config -------------------------
 load_dotenv()
-
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
-
 AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 
-from datetime import datetime  # si pas déjà importé
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+# Matching (ajustables via Render env)
+TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))
+AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.40"))
+HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"  # “radical audio-first”
 
-# Seuils — ajustables dans Render
-TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))  # texte durci
-AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.60"))  # audio plus strict
-AUDIO_MARGIN_MIN     = float(os.getenv("AUDIO_MARGIN_MIN", "0.08"))     # marge entre #1 et #2
-HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"         # audio prioritaire (ignore texte)
-
-# Message défaut
-NOT_UNDERSTOOD = "moudekoukou gnémousséwo"
+# Token admin pour modération d’évènements
+ADMIN_TOKEN          = os.getenv("ADMIN_TOKEN", "")
 
 # Clients
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    except Exception as e:
-        print("❌ Supabase init error:", e)
+    try: supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e: print("❌ Supabase init error:", e)
 
 openai_client = None
 if OPENAI_API_KEY:
-    try:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print("❌ OpenAI init error:", e)
+    try: openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e: print("❌ OpenAI init error:", e)
 
-# App
+# App + CORS
 app = FastAPI(title="Kemetia Backend")
-
-# ------------------------------------------------------------------
-# CORS permissif + preflight explicite
-# ------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -78,9 +62,9 @@ def any_options(full_path: str):
 
 @app.middleware("http")
 async def ensure_cors_headers(request: Request, call_next):
-    try:
-        resp = await call_next(request)
+    try: resp = await call_next(request)
     except Exception as e:
+        from fastapi.responses import JSONResponse
         resp = JSONResponse({"detail": "server error", "error": str(e)}, status_code=500)
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -88,9 +72,7 @@ async def ensure_cors_headers(request: Request, call_next):
     resp.headers.setdefault("Access-Control-Max-Age", "600")
     return resp
 
-# ------------------------------------------------------------------
-# Utils texte
-# ------------------------------------------------------------------
+# ------------------------- Utils texte & geo -------------------------
 def nk(s: str) -> str:
     t = (s or "").lower()
     t = unicodedata.normalize("NFD", t)
@@ -101,14 +83,20 @@ def nk(s: str) -> str:
     return t
 
 def soft_canon(s: str) -> str:
-    t = nk(s)
-    t = re.sub(r"[^a-z0-9\s]", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    t = nk(s); t = re.sub(r"[^a-z0-9\s]", "", t)
+    return re.sub(r"\s+", " ", t).strip()
 
-# ------------------------------------------------------------------
-# Health & warmup
-# ------------------------------------------------------------------
+def canon_city(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    return nk(s)
+
+def _haversine(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    dlat = math.radians(lat2-lat1); dlon = math.radians(lon2-lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+# ------------------------- Health & warmup -------------------------
 @app.get("/health")
 def health():
     return {
@@ -118,102 +106,60 @@ def health():
         "audio_worker": AUDIO_WORKER_URL or None
     }
 
-@app.get("/health_plus")
-def health_plus():
-    return {
-        "ok": True,
-        "has_openai": bool(openai_client is not None),
-        "has_supabase": bool(supabase is not None),
-        "audio_worker": AUDIO_WORKER_URL or None,
-        "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
-        "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-        "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
-        "HARD_AUDIO_ONLY": HARD_AUDIO_ONLY,
-    }
-
 @app.get("/warmup")
 def warmup():
-    """
-    Réveille le worker + précharge OpenL3 avec un son silencieux.
-    """
+    """Réveille le worker (OpenL3) avec un mini WAV silencieux."""
     try:
-        # WAV silence 200 ms (16k mono)
-        sr = 16000
-        samples = int(0.2 * sr)
+        import struct
+        sr = 16000; samples = int(0.2 * sr)
         header = b"RIFF" + struct.pack("<I", 36 + samples*2) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr*2, 2, 16) + b"data" + struct.pack("<I", samples*2)
         data = b"\x00" * (samples*2)
-        wav = header + data
-        b64 = base64.b64encode(wav).decode("ascii")
-        data_url = f"data:audio/wav;base64,{b64}"
+        data_url = "data:audio/wav;base64," + base64.b64encode(header+data).decode("ascii")
         _ = _embedding_via_worker(data_url)
-        return {"ok": True}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        print("warmup err:", e)
+    return {"ok": True}
 
-# ------------------------------------------------------------------
-# OpenAI — embeddings texte
-# ------------------------------------------------------------------
+# ------------------------- Embeddings -------------------------
 EMB_MODEL = "text-embedding-3-small"
 EMBED_FAIL_UNTIL = 0.0
 
 @lru_cache(maxsize=2048)
 def _cached_embedding(q: str):
     resp = openai_client.embeddings.create(model=EMB_MODEL, input=q)
-    vec = resp.data[0].embedding
-    return tuple(vec)
+    return tuple(resp.data[0].embedding)
 
 def embed_text(text: str) -> Optional[List[float]]:
     global EMBED_FAIL_UNTIL
-    if not openai_client:
-        return None
-    now = time.time()
-    if now < EMBED_FAIL_UNTIL:
-        return None
+    if not openai_client: return None
+    if time.time() < EMBED_FAIL_UNTIL: return None
     q = soft_canon(text)
-    if not q:
-        return None
+    if not q: return None
     try:
-        vec_tuple = _cached_embedding(q)
-        return list(vec_tuple)
+        return list(_cached_embedding(q))
     except Exception as e:
         s = str(e) or ""
-        if "ratelimit" in s.lower() or "quota" in s.lower() or "429" in s:
-            EMBED_FAIL_UNTIL = time.time() + 120
-        else:
-            EMBED_FAIL_UNTIL = time.time() + 30
-        print("❌ embed error (backoff set):", repr(e))
+        EMBED_FAIL_UNTIL = time.time() + (120 if ("429" in s or "quota" in s.lower()) else 30)
+        print("❌ embed error:", s[:140])
         return None
 
-# ------------------------------------------------------------------
-# Audio embedding via Worker
-# ------------------------------------------------------------------
 def _embedding_via_worker(data_url: str) -> List[float]:
     if not AUDIO_WORKER_URL:
-        print("⚠️ AUDIO_WORKER_URL manquant — embedding audio désactivé.")
-        return []
+        print("⚠️ AUDIO_WORKER_URL manquant"); return []
     try:
-        r = requests.post(
-            f"{AUDIO_WORKER_URL}/api/compute_audio_embedding",
-            json={"audio": data_url},
-            timeout=60
-        )
+        r = requests.post(f"{AUDIO_WORKER_URL}/api/compute_audio_embedding",
+                          json={"audio": data_url}, timeout=60)
         r.raise_for_status()
         j = r.json()
         vec = j.get("embedding") or []
         return vec if isinstance(vec, list) else []
-    except requests.HTTPError as he:
-        print("audio-worker HTTP error:", getattr(he.response, "status_code", "??"), getattr(he.response, "text", "")[:200])
-        return []
     except Exception as e:
-        print("audio-worker exception:", e)
-        return []
+        print("audio-worker error:", e); return []
 
-# ------------------------------------------------------------------
-# Schemas
-# ------------------------------------------------------------------
+# ------------------------- Schemas -------------------------
 class ChatIn(BaseModel):
     text: str = ""
-    mode: str = "exchange"      # "exchange" | "translate"
+    mode: str = "exchange"
     sourceLang: str = "mina"
     targetLang: str = "fr"
     debug: bool = True
@@ -243,18 +189,17 @@ class LearnIn(BaseModel):
     correction_row_id: Optional[int] = None
 
 class NearbyIn(BaseModel):
-    kind: str = "pharmacy"  # pharmacy | health | food
+    kind: str = "pharmacy"
     lat: float
     lon: float
     radius: int = 4000
 
-class EventsQuery(BaseModel):
-    city: Optional[str] = None
-    date_from: Optional[str] = None  # "2025-10-03"
-    date_to: Optional[str] = None
-    q: Optional[str] = None
-    limit: int = 50
+class DebugAudioIn(BaseModel):
+    audio: str
+    lang: str = "mina"
+    limit: int = 5
 
+# Evénements
 class EventSubmitIn(BaseModel):
     title: str
     title_mina: Optional[str] = None
@@ -262,75 +207,41 @@ class EventSubmitIn(BaseModel):
     description_mina: Optional[str] = None
     city: Optional[str] = None
     venue_name: Optional[str] = None
+    address: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
-    start_time: str  # ex "2025-10-03 19:00"
+    start_time: str
     end_time: Optional[str] = None
-    price_min: Optional[float] = None
-    price_max: Optional[float] = None
-    currency: Optional[str] = "XOF"
-    tags: Optional[List[str]] = None
+    price: Optional[str] = None
+    visibility: str = "local"  # 'local'|'city'|'national'|'global'
+    contact_phone: Optional[str] = None
+    contact_url: Optional[str] = None
     cover_url: Optional[str] = None
-    website: Optional[str] = None
-    phone: Optional[str] = None
-    submitter_name: Optional[str] = None
-    submitter_email: Optional[str] = None
 
-class EventReviewIn(BaseModel):
-    id: int
-    action: str               # "approve" | "reject"
-    reason: Optional[str] = None
-    admin_token: str
+class EventPublishIn(BaseModel):
+    submission_id: int
+    accept: bool = True
+    admin_note: Optional[str] = None
 
-
-class DebugAudioIn(BaseModel):
-    audio: str
-    lang: str = "mina"
-    limit: int = 5
-
-# ------------------------------------------------------------------
-# Debug audio match
-# ------------------------------------------------------------------
+# ------------------------- Debug audio-match -------------------------
 @app.post("/api/debug_audio_match")
 def api_debug_audio_match(inp: DebugAudioIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     if not (isinstance(inp.audio, str) and inp.audio.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
-
     avec = _embedding_via_worker(inp.audio)
-    if not avec:
-        raise HTTPException(status_code=500, detail="embedding vide (worker)")
+    if not avec: raise HTTPException(status_code=500, detail="embedding vide (worker)")
+    rpc = supabase.rpc("match_audio_by_vector", {
+        "p_lang": inp.lang.lower(),
+        "p_query": avec,
+        "p_limit": max(1, min(inp.limit, 20))
+    }).execute()
+    rows = rpc.data or []
+    for r in rows: r["sim"] = 1.0 - float(r.get("distance", 1.0))
+    return {"candidates": rows[:inp.limit]}
 
-    try:
-        rpc = supabase.rpc("match_audio_by_vector", {
-            "p_lang": inp.lang.lower(),
-            "p_query": avec,
-            "p_limit": max(1, min(inp.limit, 20))
-        }).execute()
-        rows = rpc.data or []
-        for r in rows:
-            r["sim"] = 1.0 - float(r.get("distance", 1.0))
-        return {"candidates": rows[:inp.limit]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"rpc error: {e}")
-
-@app.get("/api/warmup")
-def api_warmup():
-    try:
-        requests.get(f"{AUDIO_WORKER_URL}/health", timeout=10)
-    except Exception:
-        pass
-    try:
-        silent = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA="
-        _ = _embedding_via_worker(silent)
-    except Exception:
-        pass
-    return {"ok": True}
-
-# ------------------------------------------------------------------
-# Chat — audio-first + seuil + marge
-# ------------------------------------------------------------------
+# ------------------------- Chat (audio-first) -------------------------
 @app.post("/api/chat")
 def api_chat(inp: ChatIn):
     if supabase is None:
@@ -339,94 +250,66 @@ def api_chat(inp: ChatIn):
     user_text = (inp.text or "").strip()
     src_lang  = (inp.sourceLang or "mina").lower()
     tgt_lang  = (inp.targetLang or "fr").lower()
-
     base_lang = src_lang if src_lang != "fr" else tgt_lang
-    if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}:
-        base_lang = "mina"
+    if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}: base_lang = "mina"
 
     best_text = None
     best_audio = None
     audio_candidates_dbg = None
 
-    # Mode dur : on neutralise toujours le texte
     if HARD_AUDIO_ONLY:
-        user_text = ""
+        user_text = ""  # on neutralise le texte
 
-    # (1) Texte (seulement si non HARD_AUDIO_ONLY)
+    # 1) texte (si autorisé)
     if user_text and openai_client and not HARD_AUDIO_ONLY:
         try:
             qvec = embed_text(user_text)
             if qvec:
                 rpc = supabase.rpc("match_audio_meta", {
-                    "p_lang": base_lang,
-                    "p_query": qvec,
-                    "p_limit": 5
+                    "p_lang": base_lang, "p_query": qvec, "p_limit": 5
                 }).execute()
                 cand = rpc.data or []
                 if cand:
-                    b = cand[0]
-                    sim = 1.0 - float(b.get("distance", 1.0))
+                    b = cand[0]; sim = 1.0 - float(b.get("distance", 1.0))
                     best_text = {"row": b, "score": sim, "via": "embed"}
         except Exception as e:
-            print("❌ rpc match (text) error:", e)
+            print("rpc match (text) error:", e)
 
-    # (2) Audio → worker → match (PRIORITAIRE) + rerank/marge
-    candidates = []
+    # 2) audio prioritaire
     if (inp.from_audio or HARD_AUDIO_ONLY) and inp.audio:
         try:
             avec = _embedding_via_worker(inp.audio)
             if avec and supabase:
                 rpc2 = supabase.rpc("match_audio_by_vector", {
-                    "p_lang": base_lang,
-                    "p_query": avec,
-                    "p_limit": 5
+                    "p_lang": base_lang, "p_query": avec, "p_limit": 5
                 }).execute()
                 cand2 = rpc2.data or []
-
-                for it in cand2:
-                    if (it.get("lang") or base_lang).lower() != base_lang:
-                        continue
-                    if it.get("is_enabled") is False:
-                        continue
-                    sim = 1.0 - float(it.get("distance", 1.0))
-                    candidates.append({"row": it, "sim": sim})
-
-                candidates.sort(key=lambda x: x["sim"], reverse=True)
-
-                audio_candidates_dbg = [{
-                    "row_id": it["row"].get("id"),
-                    "sim": round(it["sim"], 4),
-                    "text": (it["row"].get("text") or "").strip(),
-                    "fr": (it["row"].get("fr") or "").strip(),
-                    "reply_same": (it["row"].get("reply_same") or "").strip(),
-                } for it in candidates[:5]]
-
-                if candidates:
-                    sim1 = candidates[0]["sim"]
-                    sim2 = candidates[1]["sim"] if len(candidates) > 1 else 0.0
-                    if sim1 >= AUDIO_SIM_THRESHOLD and (sim1 - sim2) >= AUDIO_MARGIN_MIN:
-                        best_audio = {"row": candidates[0]["row"], "score": sim1, "via": "audio-embed"}
-                    elif HARD_AUDIO_ONLY:
-                        # En mode dur, on force #1 (utile en phase de débogage)
-                        best_audio = {"row": candidates[0]["row"], "score": sim1, "via": "audio-embed-forced"}
+                if cand2:
+                    b2   = cand2[0]; sim2 = 1.0 - float(b2.get("distance", 1.0))
+                    best_audio = {"row": b2, "score": sim2, "via": "audio-embed"}
+                    audio_candidates_dbg = [{
+                        "row_id": it.get("id"),
+                        "sim": round(1.0 - float(it.get("distance", 1.0)), 4),
+                        "text": (it.get("text") or "").strip(),
+                        "fr": (it.get("fr") or "").strip(),
+                        "reply_same": (it.get("reply_same") or "").strip(),
+                    } for it in cand2]
         except Exception as e:
-            print("❌ audio-embed via worker error:", e)
+            print("audio-embed error:", e)
 
-    # (3) Arbitrage
+    # 3) arbitrage
     final_hit, via = None, "fallback"
-    if best_audio and best_audio["via"] == "audio-embed":
-        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
-        via = "audio-embed"
-    elif best_audio and best_audio["via"] == "audio-embed-forced":
-        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
-        via = "audio-embed-forced"
+    if best_audio and best_audio["score"] >= AUDIO_SIM_THRESHOLD:
+        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}; via = "audio-embed"
+    elif best_audio and HARD_AUDIO_ONLY:
+        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}; via = "audio-embed-forced"
     elif best_text and not HARD_AUDIO_ONLY and best_text["score"] >= TEXT_SIM_THRESHOLD:
-        final_hit = {"row": best_text["row"], "score": best_text["score"]}
-        via = "embed"
+        final_hit = {"row": best_text["row"], "score": best_text["score"]}; via = "embed"
 
-    # 4) Réponse (STRICT : on ne renvoie pas “n’importe quoi”)
+    # 4) réponse
     if not final_hit:
-        out = {"reply": NOT_UNDERSTOOD, "row_id": None}
+        default_mina = "moudékoukou gnémousséwo"
+        out = {"reply": default_mina, "row_id": None}
         if inp.debug:
             out["debug"] = {
                 "from_audio": bool(inp.from_audio),
@@ -437,78 +320,35 @@ def api_chat(inp: ChatIn):
                 "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
                 "baseLang": base_lang,
                 "audio_candidates": audio_candidates_dbg,
-                "best_text": None if not best_text else {
-                    "row_id": best_text["row"].get("id"),
-                    "score": round(best_text["score"], 4)
-                },
-                "best_audio": None if not best_audio else {
-                    "row_id": best_audio["row"].get("id"),
-                    "score": round(best_audio["score"], 4)
-                },
+                "best_text": None if not best_text else {"row_id": best_text["row"].get("id"), "score": round(best_text["score"],4)},
+                "best_audio": None if not best_audio else {"row_id": best_audio["row"].get("id"), "score": round(best_audio["score"],4)},
                 "note": "no match → default"
             }
         try:
             supabase.table("server_logs").insert({
-                "kind": "no_match",
-                "base_lang": base_lang,
+                "kind": "no_match", "base_lang": base_lang,
                 "meta": {"from_audio": bool(inp.from_audio), "audio_only": HARD_AUDIO_ONLY},
                 "debug": json.dumps(out.get("debug", {}))
             }).execute()
-        except Exception:
-            pass
+        except Exception: pass
         return out
 
-    # COM2 : champs propres
-    r  = final_hit["row"]
-    tx = (r.get("text") or "").strip()
-    rs = (r.get("reply_same") or "").strip()
-    fr = (r.get("fr") or "").strip()
-    en = (r.get("en") or "").strip()
+    r = final_hit["row"]
+    rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
 
-    # COM3 : mapping STRICT
-    reply = None
-    if inp.mode == "exchange":
-        # En échange, on DOIT répondre reply_same
-        reply = rs or None
+    if inp.mode == "exchange" or tgt_lang == "same":
+        reply = rs or tx or fr or en or ""
     else:
-        # translate strict
-        if tgt_lang == "fr":
-            reply = fr or None
-        elif tgt_lang == "en":
-            reply = en or None
-        elif tgt_lang in {"mina", "bm", "ee", "ha", "sw"}:
-            # vers langue locale → text (ou reply_same si text absent)
-            reply = tx or rs or None
+        if src_lang == "fr":
+            if tgt_lang in {"mina","bm","ee","ha","sw"}: reply = tx or rs or en or fr or ""
+            elif tgt_lang == "en": reply = en or fr or tx or rs or ""
+            else: reply = fr or ""
         else:
-            reply = fr or en or None
+            if   tgt_lang == "fr": reply = fr or tx or rs or en or ""
+            elif tgt_lang == "en": reply = en or fr or tx or rs or ""
+            elif tgt_lang == src_lang: reply = tx or rs or fr or en or ""
+            else: reply = tx or rs or fr or en or ""
 
-    # Si rien de valide → défaut
-    if not reply:
-        out = {"reply": NOT_UNDERSTOOD, "row_id": None}
-        if inp.debug:
-            out["debug"] = {
-                "from_audio": bool(inp.from_audio),
-                "has_text": bool(user_text),
-                "via": via,
-                "mode_audio_only": HARD_AUDIO_ONLY,
-                "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-                "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
-                "baseLang": base_lang,
-                "best_text": None if not best_text else {
-                    "row_id": best_text["row"].get("id"),
-                    "score": round(best_text["score"], 4)
-                },
-                "best_audio": None if not best_audio else {
-                    "row_id": best_audio["row"].get("id"),
-                    "score": round(best_audio["score"], 4)
-                },
-                "audio_candidates": audio_candidates_dbg,
-                "chosen_row_id": r.get("id"),
-                "note": "strict mapping: missing required field for this mode"
-            }
-        return out
-
-    # Réponse OK
     out = {"reply": reply, "row_id": r.get("id")}
     if inp.debug:
         out["debug"] = {
@@ -519,27 +359,18 @@ def api_chat(inp: ChatIn):
             "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
             "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
             "baseLang": base_lang,
-            "best_text": None if not best_text else {
-                "row_id": best_text["row"].get("id"),
-                "score": round(best_text["score"], 4)
-            },
-            "best_audio": None if not best_audio else {
-                "row_id": best_audio["row"].get("id"),
-                "score": round(best_audio["score"], 4)
-            },
+            "best_text": None if not best_text else {"row_id": best_text["row"].get("id"), "score": round(best_text["score"],4)},
+            "best_audio": None if not best_audio else {"row_id": best_audio["row"].get("id"), "score": round(best_audio["score"],4)},
             "audio_candidates": audio_candidates_dbg,
             "chosen_row_id": r.get("id")
         }
     return out
 
-# ------------------------------------------------------------------
-# Collect — insert + embeddings (texte + audio)
-# ------------------------------------------------------------------
+# ------------------------- Collect -------------------------
 @app.post("/api/collect")
 def api_collect(inp: CollectIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-
     row = {
         "lang": (inp.lang or "").lower(),
         "category": (inp.category or "").strip() or None,
@@ -551,113 +382,60 @@ def api_collect(inp: CollectIn):
         "filename": (inp.filename or "").strip() or None,
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        "is_enabled": True
     }
-    if not row["text"]:
-        raise HTTPException(status_code=400, detail="text obligatoire")
-
-    # Embedding texte
-    try:
-        vec = embed_text(row["text"])
-        if vec:
-            row["embedding"] = vec
-    except Exception as e:
-        print("embed_text error:", e)
-
-    # Embedding audio (si audio present)
-    if inp.audio and isinstance(inp.audio, str) and inp.audio.startswith("data:") and USE_AUDIO_EMB:
-        try:
-            avec = _embedding_via_worker(inp.audio)
-            if avec:
-                row["audio_embedding"] = avec
-        except Exception as e:
-            print("audio_embedding error:", e)
-
+    if not row["text"]: raise HTTPException(status_code=400, detail="text obligatoire")
+    vec = embed_text(row["text"])
+    if vec: row["embedding"] = vec
     res = supabase.table("audio_meta").insert(row).execute()
-    if not res.data:
-        raise HTTPException(status_code=500, detail="Insert échoué")
+    if not res.data: raise HTTPException(status_code=500, detail="Insert échoué")
     return {"ok": True, "id": res.data[0]["id"]}
 
-# ------------------------------------------------------------------
-# Learn
-# ------------------------------------------------------------------
+# ------------------------- Learn -------------------------
 @app.post("/api/learn")
 def api_learn(inp: LearnIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     row = {
-        "row_id": inp.row_id,
-        "accepted": bool(inp.accepted),
-        "input_type": inp.input_type,
-        "correction_text": (inp.correction_text or None),
-        "correction_row_id": inp.correction_row_id,
-        "meta": {"ip": None, "ua": "fastapi"}
+        "row_id": inp.row_id, "accepted": bool(inp.accepted),
+        "input_type": inp.input_type, "correction_text": (inp.correction_text or None),
+        "correction_row_id": inp.correction_row_id, "meta": {"ip": None, "ua": "fastapi"}
     }
     res = supabase.table("events").insert(row).execute()
-    if not res.data:
-        raise HTTPException(status_code=500, detail="Insert events échoué")
+    if not res.data: raise HTTPException(status_code=500, detail="Insert events échoué")
     return {"ok": True, "inserted": res.data[0]}
 
-# ------------------------------------------------------------------
-# STT (Whisper)
-# ------------------------------------------------------------------
+# ------------------------- STT (Whisper) -------------------------
 @app.post("/api/stt")
 def api_stt(payload: Dict[str, Any]):
     if not openai_client:
         raise HTTPException(status_code=501, detail="STT non configuré (OPENAI_API_KEY manquant)")
-
     data_url = (payload or {}).get("audio") or ""
     if not (isinstance(data_url, str) and data_url.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
-
     try:
-        header, b64 = data_url.split(",", 1)
-        raw = base64.b64decode(b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="audio invalide")
-
+        header, b64 = data_url.split(",", 1); raw = base64.b64decode(b64)
+    except Exception: raise HTTPException(status_code=400, detail="audio invalide")
     mime = "application/octet-stream"
-    try:
-        m = header.split(";")[0]
-        mime = m.split(":", 1)[1] or mime
-    except Exception:
-        pass
-
+    try: mime = header.split(";")[0].split(":",1)[1] or mime
+    except Exception: pass
     ext = ".bin"
-    if "webm" in mime: ext = ".webm"
-    elif "ogg" in mime: ext = ".ogg"
+    if   "webm" in mime: ext = ".webm"
+    elif "ogg" in mime:  ext = ".ogg"
     elif "mp4" in mime or "m4a" in mime: ext = ".m4a"
-    elif "wav" in mime: ext = ".wav"
-
+    elif "wav" in mime:  ext = ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-        f.write(raw)
-        tmp_path = f.name
-
+        f.write(raw); tmp_path = f.name
     try:
         with open(tmp_path, "rb") as fh:
-            tr = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=fh
-            )
-        text = (getattr(tr, "text", "") or "").strip()
-        return {"text": text}
+            tr = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
+        return {"text": (getattr(tr, "text", "") or "").strip()}
     except Exception as e:
-        print("❌ STT error:", repr(e))
-        raise HTTPException(status_code=500, detail="STT error")
+        print("❌ STT error:", repr(e)); raise HTTPException(status_code=500, detail="STT error")
     finally:
         try: os.remove(tmp_path)
         except: pass
 
-# ------------------------------------------------------------------
-# OSM Nearby
-# ------------------------------------------------------------------
-def _haversine(lat1, lon1, lat2, lon2):
-    R = 6371000.0
-    dlat = math.radians(lat2-lat1)
-    dlon = math.radians(lon2-lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return 2*R*math.asin(math.sqrt(a))
-
+# ------------------------- Nearby (OSM) -------------------------
 def _osm_query_for(kind: str) -> str:
     if kind == "pharmacy":
         return '(node["amenity"="pharmacy"](around:{rad},{lat},{lon}););'
@@ -675,171 +453,160 @@ def _osm_query_for(kind: str) -> str:
            ');'
 
 def _osm_nearby(kind: str, lat: float, lon: float, radius: int) -> List[dict]:
-    q_body = f"""
-    [out:json][timeout:25];
-    {_osm_query_for(kind).format(lat=lat, lon=lon, rad=radius)}
-    out body;
-    """
+    q_body = f"""[out:json][timeout:25];{_osm_query_for(kind).format(lat=lat, lon=lon, rad=radius)}out body;"""
     try:
         r = requests.post("https://overpass-api.de/api/interpreter", data=q_body.encode("utf-8"), timeout=30)
-        r.raise_for_status()
-        data = r.json()
+        r.raise_for_status(); data = r.json()
     except Exception as e:
-        print("OSM error:", e)
-        return []
-
+        print("OSM error:", e); return []
     out = []
     for el in data.get("elements", []):
-        if el.get("type") != "node":
-            continue
-        tags = el.get("tags", {}) or {}
-        name = tags.get("name") or "(sans nom)"
+        if el.get("type") != "node": continue
+        tags = el.get("tags", {}) or {}; name = tags.get("name") or "(sans nom)"
         addr_parts = [tags.get(k) for k in ("addr:street","addr:housenumber","addr:city") if tags.get(k)]
         addr = ", ".join(addr_parts) if addr_parts else None
-        lat2, lon2 = float(el["lat"]), float(el["lon"])
-        dist = int(_haversine(lat, lon, lat2, lon2))
+        lat2, lon2 = float(el["lat"]), float(el["lon"]); dist = int(_haversine(lat, lon, lat2, lon2))
         cat = tags.get("amenity") or kind
-        out.append({
-            "name": name,
-            "category": cat,
-            "addr": addr,
-            "lat": lat2,
-            "lon": lon2,
-            "distance_m": dist,
-            "opening_hours": tags.get("opening_hours"),
-            "osm_id": f'{el.get("type","node")}/{el.get("id")}'
-        })
-    out.sort(key=lambda x: x["distance_m"])
-    return out
+        out.append({"name": name, "category": cat, "addr": addr, "lat": lat2, "lon": lon2, "distance_m": dist})
+    out.sort(key=lambda x: x["distance_m"]); return out
 
 @app.post("/api/nearby")
 def api_nearby(inp: NearbyIn):
     kind = (inp.kind or "pharmacy").lower()
-    if kind not in {"pharmacy","health","food"}:
-        kind = "pharmacy"
+    if kind not in {"pharmacy","health","food"}: kind = "pharmacy"
     items = _osm_nearby(kind, float(inp.lat), float(inp.lon), int(inp.radius or 4000))
-    if not items:
-        return {"items": [], "notice": "Aucun résultat dans ce rayon."}
-    return {"items": items[:25]}
+    return {"items": items[:25]} if items else {"items": [], "notice": "Aucun résultat dans ce rayon."}
 
-@app.post("/api/events")
-def api_events(q: EventsQuery):
+# ------------------------- Audio embedding proxy -------------------------
+@app.post("/api/compute_audio_embedding")
+def api_compute_audio_embedding(payload: dict):
+    if not USE_AUDIO_EMB: raise HTTPException(status_code=501, detail="audio-embedding désactivé")
+    data_url = (payload or {}).get("audio") or ""
+    if not (isinstance(data_url, str) and data_url.startswith("data:")):
+        raise HTTPException(status_code=400, detail="audio dataURL requis")
+    vec = _embedding_via_worker(data_url)
+    if not vec: raise HTTPException(status_code=500, detail="embedding vide")
+    return {"embedding": vec, "dim": len(vec)}
+
+# ------------------------- EVENTS (public + admin) -------------------------
+@app.get("/api/events_public")
+def api_events_public(
+    lat: Optional[float] = None, lon: Optional[float] = None, radius: int = 5000,
+    city: Optional[str] = None, limit: int = 50
+):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
+    now = datetime.now(timezone.utc); rows = []
+
+    # Global / national (partout)
     try:
-        s = supabase.from_("events").select("*").eq("is_published", True)
-        if q.city:
-            s = s.ilike("city", f"%{q.city}%")
-        if q.date_from:
-            s = s.gte("start_time", q.date_from)
-        if q.date_to:
-            s = s.lte("start_time", q.date_to + " 23:59:59")
-        if q.q:
-            s = s.or_(f"title.ilike.%{q.q}%,description.ilike.%{q.q}%")
-        s = s.order("start_time", desc=False).limit(max(1, min(q.limit, 200)))
-        data = s.execute().data or []
-        return {"items": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"events error: {e}")
+        r1 = supabase.table("events").select("*")\
+            .eq("is_published", True)\
+            .in_("visibility", ["global","national"])\
+            .gte("end_time", now.isoformat())\
+            .order("start_time", desc=False).limit(limit).execute()
+        rows += (r1.data or [])
+    except Exception as e: print("events_public global/national error:", e)
 
-@app.get("/api/event/{eid}")
-def api_event(eid: int):
+    # City
+    if city:
+        try:
+            r2 = supabase.table("events").select("*")\
+                .eq("is_published", True)\
+                .eq("visibility", "city")\
+                .gte("end_time", now.isoformat())\
+                .order("start_time", desc=False).limit(limit).execute()
+            c_city = canon_city(city)
+            rows += [it for it in (r2.data or []) if canon_city(it.get("city")) == c_city]
+        except Exception as e: print("events_public city error:", e)
+
+    # Local (rayon)
+    if lat is not None and lon is not None:
+        try:
+            r3 = supabase.table("events").select("*")\
+                .eq("is_published", True)\
+                .eq("visibility", "local")\
+                .gte("end_time", now.isoformat())\
+                .order("start_time", desc=False).limit(200).execute()
+            loc = []
+            for it in (r3.data or []):
+                lt, ln = it.get("lat"), it.get("lon")
+                if lt is None or ln is None: continue
+                try: d = _haversine(float(lat), float(lon), float(lt), float(ln))
+                except Exception: continue
+                if d <= float(max(100, radius)):
+                    it["distance_m"] = int(d); loc.append(it)
+            loc.sort(key=lambda x: x.get("distance_m", 0))
+            rows += loc
+        except Exception as e: print("events_public local error:", e)
+
+    # dedup + tri + cap
+    seen, unique = set(), []
+    for it in rows:
+        i = it.get("id")
+        if i in seen: continue
+        seen.add(i); unique.append(it)
+    unique.sort(key=lambda x: x.get("start_time") or "")
+    return {"items": unique[:max(1, min(200, limit))]}
+
+@app.get("/api/events/{event_id}")
+def api_event_detail(event_id: int):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-    r = supabase.from_("events").select("*").eq("id", eid).single().execute()
-    if not r.data:
-        raise HTTPException(status_code=404, detail="not found")
-    return r.data
+    r = supabase.table("events").select("*").eq("id", event_id).limit(1).execute()
+    it = (r.data or [None])[0]
+    if not it: raise HTTPException(status_code=404, detail="Event not found")
+    return it
 
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-
-    if not inp.title or not inp.start_time:
+    vis = (inp.visibility or "local").lower()
+    if vis not in ("local","city","national","global"): vis = "local"
+    row = {
+        "title": (inp.title or "").strip(),
+        "title_mina": inp.title_mina, "description": inp.description, "description_mina": inp.description_mina,
+        "city": inp.city, "venue_name": inp.venue_name, "address": inp.address,
+        "lat": inp.lat, "lon": inp.lon,
+        "start_time": inp.start_time, "end_time": inp.end_time,
+        "price": inp.price, "visibility": vis,
+        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url, "cover_url": inp.cover_url,
+        "accepted": None
+    }
+    if not row["title"] or not row["start_time"]:
         raise HTTPException(status_code=400, detail="title et start_time requis")
+    res = supabase.table("event_submissions").insert(row).execute()
+    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
+    return {"ok": True, "submission_id": res.data[0]["id"]}
 
-    row = inp.model_dump()
-    if row.get("tags") and not isinstance(row["tags"], list):
-        row["tags"] = [str(row["tags"])]
-
-    r = supabase.table("event_submissions").insert(row).execute()
-    if not r.data:
-        raise HTTPException(status_code=500, detail="insert submission failed")
-    return {"ok": True, "id": r.data[0]["id"]}
-
-@app.post("/api/event_submissions")
-def api_event_submissions(payload: Dict[str, Any]):
-    if (payload or {}).get("admin_token") != ADMIN_TOKEN or not ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="unauthorized")
-
-    status = (payload or {}).get("status") or "pending"
-    limit  = int((payload or {}).get("limit") or 100)
-    try:
-        s = supabase.from_("event_submissions").select("*").eq("status", status)\
-            .order("created_at", desc=True).limit(min(limit, 200))
-        data = s.execute().data or []
-        return {"items": data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"list submissions error: {e}")
-
-@app.post("/api/event_review")
-def api_event_review(inp: EventReviewIn):
-    if inp.admin_token != ADMIN_TOKEN or not ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="unauthorized")
+@app.post("/api/events_admin/publish")
+def api_events_admin_publish(inp: EventPublishIn, request: Request):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    token = auth.replace("Bearer", "").strip()
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    sub = supabase.from_("event_submissions").select("*").eq("id", inp.id).single().execute().data
-    if not sub:
-        raise HTTPException(status_code=404, detail="submission not found")
+    r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
+    sub = (r.data or [None])[0]
+    if not sub: raise HTTPException(status_code=404, detail="Submission not found")
 
-    if inp.action == "reject":
-        supabase.table("event_submissions").update({
-            "status": "rejected", "reason": inp.reason or "rejected"
-        }).eq("id", inp.id).execute()
-        return {"ok": True, "status": "rejected"}
+    if not inp.accept:
+        supabase.table("event_submissions").update({"accepted": False, "admin_note": inp.admin_note or "refused"})\
+            .eq("id", inp.submission_id).execute()
+        return {"ok": True, "published": False}
 
-    if inp.action == "approve":
-        ev = {
-            "title": sub.get("title"),
-            "title_mina": sub.get("title_mina"),
-            "description": sub.get("description"),
-            "description_mina": sub.get("description_mina"),
-            "city": sub.get("city"),
-            "venue_name": sub.get("venue_name"),
-            "lat": sub.get("lat"),
-            "lon": sub.get("lon"),
-            "start_time": sub.get("start_time"),
-            "end_time": sub.get("end_time"),
-            "price_min": sub.get("price_min"),
-            "price_max": sub.get("price_max"),
-            "currency": sub.get("currency") or "XOF",
-            "tags": sub.get("tags"),
-            "cover_url": sub.get("cover_url"),
-            "website": sub.get("website"),
-            "phone": sub.get("phone"),
-            "is_published": True
-        }
-        ins = supabase.table("events").insert(ev).execute()
-        if not ins.data:
-            raise HTTPException(status_code=500, detail="insert event failed")
-        supabase.table("event_submissions").update({"status":"approved"}).eq("id", inp.id).execute()
-        return {"ok": True, "status": "approved", "event_id": ins.data[0]["id"]}
+    pub = {k: sub.get(k) for k in [
+        "title","title_mina","description","description_mina","city","venue_name","address",
+        "lat","lon","start_time","end_time","price","visibility","contact_phone","contact_url","cover_url"
+    ]}
+    pub["is_published"] = True
+    ins = supabase.table("events").insert(pub).execute()
+    if not ins.data: raise HTTPException(status_code=500, detail="Insert events failed")
 
-    raise HTTPException(status_code=400, detail="action inconnue")
+    supabase.table("event_submissions").update({"accepted": True, "admin_note": inp.admin_note or "published"})\
+        .eq("id", inp.submission_id).execute()
 
-# ------------------------------------------------------------------
-# Proxy compute embedding (utile pour diag)
-# ------------------------------------------------------------------
-@app.post("/api/compute_audio_embedding")
-def api_compute_audio_embedding(payload: dict):
-    if not USE_AUDIO_EMB:
-        raise HTTPException(status_code=501, detail="audio-embedding désactivé (set USE_AUDIO_EMB=1)")
-    data_url = (payload or {}).get("audio") or ""
-    if not (isinstance(data_url, str) and data_url.startswith("data:")):
-        raise HTTPException(status_code=400, detail="audio dataURL requis")
-    vec = _embedding_via_worker(data_url)
-    if not vec:
-        raise HTTPException(status_code=500, detail="embedding vide")
-    return {"embedding": vec, "dim": len(vec)}
+    return {"ok": True, "published": True, "event_id": ins.data[0]["id"]}
