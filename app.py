@@ -1,19 +1,22 @@
-# app.py — FastAPI (Kemetia)
+# app.py — FastAPI (Kemetia) — audio-first + seuil+marge
 from __future__ import annotations
 
-import os, re, json, base64, tempfile, unicodedata, time, math
+import os, re, json, base64, tempfile, unicodedata, time, math, struct
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ------------------------- Config & clients -------------------------
+# ------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------
 load_dotenv()
 
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
@@ -23,12 +26,13 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
 
-# Seuils (ajustables dans Render)
-TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))  # on durcit le texte
-AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.40"))  # on assouplit l’audio
-HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"        # 1 = on ignore le texte
+# Seuils — ajustables dans Render
+TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))  # texte durci
+AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.60"))  # audio plus strict
+AUDIO_MARGIN_MIN     = float(os.getenv("AUDIO_MARGIN_MIN", "0.08"))     # marge entre #1 et #2
+HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"         # audio prioritaire (ignore texte)
 
-
+# Clients
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     try:
@@ -43,9 +47,12 @@ if OPENAI_API_KEY:
     except Exception as e:
         print("❌ OpenAI init error:", e)
 
+# App
 app = FastAPI(title="Kemetia Backend")
 
-# CORS permissif
+# ------------------------------------------------------------------
+# CORS permissif + preflight explicite
+# ------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,8 +60,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# --- CORS preflight explicit (en plus du CORSMiddleware) ---
-from fastapi.responses import Response
 
 @app.options("/{full_path:path}", include_in_schema=False)
 def any_options(full_path: str):
@@ -65,13 +70,11 @@ def any_options(full_path: str):
     resp.headers["Access-Control-Max-Age"] = "600"
     return resp
 
-
 @app.middleware("http")
 async def ensure_cors_headers(request: Request, call_next):
     try:
         resp = await call_next(request)
     except Exception as e:
-        from fastapi.responses import JSONResponse
         resp = JSONResponse({"detail": "server error", "error": str(e)}, status_code=500)
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -79,7 +82,9 @@ async def ensure_cors_headers(request: Request, call_next):
     resp.headers.setdefault("Access-Control-Max-Age", "600")
     return resp
 
-# ------------------------- Utils texte -------------------------
+# ------------------------------------------------------------------
+# Utils texte
+# ------------------------------------------------------------------
 def nk(s: str) -> str:
     t = (s or "").lower()
     t = unicodedata.normalize("NFD", t)
@@ -95,6 +100,17 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# ------------------------------------------------------------------
+# Health & warmup
+# ------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "has_openai": bool(openai_client is not None),
+        "has_supabase": bool(supabase is not None),
+        "audio_worker": AUDIO_WORKER_URL or None
+    }
 
 @app.get("/health_plus")
 def health_plus():
@@ -105,14 +121,32 @@ def health_plus():
         "audio_worker": AUDIO_WORKER_URL or None,
         "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
         "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-        "AUDIO_FORCE": AUDIO_FORCE,
+        "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
+        "HARD_AUDIO_ONLY": HARD_AUDIO_ONLY,
     }
 
 @app.get("/warmup")
 def warmup():
-    return {"ok": True}
-    
-# ------------------------- OpenAI Embeddings (texte) -------------------------
+    """
+    Réveille le worker + précharge OpenL3 avec un son silencieux.
+    """
+    try:
+        # WAV silence 200 ms (16k mono)
+        sr = 16000
+        samples = int(0.2 * sr)
+        header = b"RIFF" + struct.pack("<I", 36 + samples*2) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr*2, 2, 16) + b"data" + struct.pack("<I", samples*2)
+        data = b"\x00" * (samples*2)
+        wav = header + data
+        b64 = base64.b64encode(wav).decode("ascii")
+        data_url = f"data:audio/wav;base64,{b64}"
+        _ = _embedding_via_worker(data_url)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ------------------------------------------------------------------
+# OpenAI — embeddings texte
+# ------------------------------------------------------------------
 EMB_MODEL = "text-embedding-3-small"
 EMBED_FAIL_UNTIL = 0.0
 
@@ -137,14 +171,16 @@ def embed_text(text: str) -> Optional[List[float]]:
         return list(vec_tuple)
     except Exception as e:
         s = str(e) or ""
-        if "RateLimit" in s or "quota" in s.lower() or "429" in s:
+        if "ratelimit" in s.lower() or "quota" in s.lower() or "429" in s:
             EMBED_FAIL_UNTIL = time.time() + 120
         else:
             EMBED_FAIL_UNTIL = time.time() + 30
         print("❌ embed error (backoff set):", repr(e))
         return None
 
-# ------------------------- Audio embedding via Worker -------------------------
+# ------------------------------------------------------------------
+# Audio embedding via Worker
+# ------------------------------------------------------------------
 def _embedding_via_worker(data_url: str) -> List[float]:
     if not AUDIO_WORKER_URL:
         print("⚠️ AUDIO_WORKER_URL manquant — embedding audio désactivé.")
@@ -166,10 +202,12 @@ def _embedding_via_worker(data_url: str) -> List[float]:
         print("audio-worker exception:", e)
         return []
 
-# ------------------------- Schemas -------------------------
+# ------------------------------------------------------------------
+# Schemas
+# ------------------------------------------------------------------
 class ChatIn(BaseModel):
     text: str = ""
-    mode: str = "exchange"     # "exchange" | "translate"
+    mode: str = "exchange"      # "exchange" | "translate"
     sourceLang: str = "mina"
     targetLang: str = "fr"
     debug: bool = True
@@ -204,50 +242,18 @@ class NearbyIn(BaseModel):
     lon: float
     radius: int = 4000
 
-# ------------------------- Health & warmup -------------------------
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "has_openai": bool(openai_client is not None),
-        "has_supabase": bool(supabase is not None),
-        "audio_worker": AUDIO_WORKER_URL or None
-    }
-
-@app.get("/warmup")
-def warmup():
-    """
-    Réveille le worker + précharge OpenL3 avec un son silencieux.
-    """
-    try:
-        # petit WAV silencieux base64 (16k mono ~200ms)
-        import struct, base64
-        sr = 16000
-        samples = int(0.2 * sr)
-        # header WAV
-        header = b"RIFF" + struct.pack("<I", 36 + samples*2) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr*2, 2, 16) + b"data" + struct.pack("<I", samples*2)
-        data = b"\x00" * (samples*2)
-        wav = header + data
-        b64 = base64.b64encode(wav).decode("ascii")
-        data_url = f"data:audio/wav;base64,{b64}"
-
-        # Proxy compute → worker (ça réveille l’instance)
-        _ = _embedding_via_worker(data_url)
-
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 class DebugAudioIn(BaseModel):
     audio: str
     lang: str = "mina"
     limit: int = 5
 
+# ------------------------------------------------------------------
+# Debug audio match
+# ------------------------------------------------------------------
 @app.post("/api/debug_audio_match")
 def api_debug_audio_match(inp: DebugAudioIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-
     if not (isinstance(inp.audio, str) and inp.audio.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
 
@@ -262,7 +268,6 @@ def api_debug_audio_match(inp: DebugAudioIn):
             "p_limit": max(1, min(inp.limit, 20))
         }).execute()
         rows = rpc.data or []
-        # ajoute sim = 1 - distance
         for r in rows:
             r["sim"] = 1.0 - float(r.get("distance", 1.0))
         return {"candidates": rows[:inp.limit]}
@@ -275,7 +280,6 @@ def api_warmup():
         requests.get(f"{AUDIO_WORKER_URL}/health", timeout=10)
     except Exception:
         pass
-    # micro-embedding (silence) pour réveiller TF/OpenL3
     try:
         silent = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA="
         _ = _embedding_via_worker(silent)
@@ -283,15 +287,14 @@ def api_warmup():
         pass
     return {"ok": True}
 
-# ------------------------- Chat -------------------------
-
-
+# ------------------------------------------------------------------
+# Chat — audio-first + seuil + marge
+# ------------------------------------------------------------------
 @app.post("/api/chat")
 def api_chat(inp: ChatIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # --- Params ---
     user_text = (inp.text or "").strip()
     src_lang  = (inp.sourceLang or "mina").lower()
     tgt_lang  = (inp.targetLang or "fr").lower()
@@ -304,11 +307,11 @@ def api_chat(inp: ChatIn):
     best_audio = None
     audio_candidates_dbg = None
 
-    # --- Mode radical: AUDIO ONLY ---
+    # Mode dur : on neutralise toujours le texte
     if HARD_AUDIO_ONLY:
-        user_text = ""  # on neutralise le texte même si présent
+        user_text = ""
 
-    # 1) (Optionnel) TEXTE → embedding → match (désactivé si HARD_AUDIO_ONLY=1)
+    # (1) Texte (seulement si non HARD_AUDIO_ONLY)
     if user_text and openai_client and not HARD_AUDIO_ONLY:
         try:
             qvec = embed_text(user_text)
@@ -326,7 +329,8 @@ def api_chat(inp: ChatIn):
         except Exception as e:
             print("❌ rpc match (text) error:", e)
 
-    # 2) AUDIO → worker → match (PRIORITAIRE)
+    # (2) Audio → worker → match (PRIORITAIRE) + rerank/marge
+    candidates = []
     if (inp.from_audio or HARD_AUDIO_ONLY) and inp.audio:
         try:
             avec = _embedding_via_worker(inp.audio)
@@ -337,38 +341,49 @@ def api_chat(inp: ChatIn):
                     "p_limit": 5
                 }).execute()
                 cand2 = rpc2.data or []
-                if cand2:
-                    b2   = cand2[0]
-                    sim2 = 1.0 - float(b2.get("distance", 1.0))
-                    best_audio = {"row": b2, "score": sim2, "via": "audio-embed"}
-                    # debug
-                    audio_candidates_dbg = [{
-                        "row_id": it.get("id"),
-                        "sim": round(1.0 - float(it.get("distance", 1.0)), 4),
-                        "text": (it.get("text") or "").strip(),
-                        "fr": (it.get("fr") or "").strip(),
-                        "reply_same": (it.get("reply_same") or "").strip(),
-                    } for it in cand2]
+
+                for it in cand2:
+                    if (it.get("lang") or base_lang).lower() != base_lang:
+                        continue
+                    if it.get("is_enabled") is False:
+                        continue
+                    sim = 1.0 - float(it.get("distance", 1.0))
+                    candidates.append({"row": it, "sim": sim})
+
+                candidates.sort(key=lambda x: x["sim"], reverse=True)
+
+                audio_candidates_dbg = [{
+                    "row_id": it["row"].get("id"),
+                    "sim": round(it["sim"], 4),
+                    "text": (it["row"].get("text") or "").strip(),
+                    "fr": (it["row"].get("fr") or "").strip(),
+                    "reply_same": (it["row"].get("reply_same") or "").strip(),
+                } for it in candidates[:5]]
+
+                if candidates:
+                    sim1 = candidates[0]["sim"]
+                    sim2 = candidates[1]["sim"] if len(candidates) > 1 else 0.0
+                    if sim1 >= AUDIO_SIM_THRESHOLD and (sim1 - sim2) >= AUDIO_MARGIN_MIN:
+                        best_audio = {"row": candidates[0]["row"], "score": sim1, "via": "audio-embed"}
+                    elif HARD_AUDIO_ONLY:
+                        # En mode dur, on force #1 (utile en phase de débogage)
+                        best_audio = {"row": candidates[0]["row"], "score": sim1, "via": "audio-embed-forced"}
         except Exception as e:
             print("❌ audio-embed via worker error:", e)
 
-    # 3) Arbitrage — AUDIO > TEXTE (et seuils)
+    # (3) Arbitrage
     final_hit, via = None, "fallback"
-
-    # a) si on a de l’audio et score >= seuil → ON PREND
-    if best_audio and best_audio["score"] >= AUDIO_SIM_THRESHOLD:
+    if best_audio and best_audio["via"] == "audio-embed":
         final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
         via = "audio-embed"
-    # b) si on a de l’audio mais score < seuil… en mode dur on PREND QUAND MÊME (pour débug & casser la régression)
-    elif best_audio and HARD_AUDIO_ONLY:
+    elif best_audio and best_audio["via"] == "audio-embed-forced":
         final_hit = {"row": best_audio["row"], "score": best_audio["score"]}
         via = "audio-embed-forced"
-    # c) sinon on tente le texte (seulement si non HARD_AUDIO_ONLY)
     elif best_text and not HARD_AUDIO_ONLY and best_text["score"] >= TEXT_SIM_THRESHOLD:
         final_hit = {"row": best_text["row"], "score": best_text["score"]}
         via = "embed"
 
-    # 4) Réponse
+    # (4) Réponse
     if not final_hit:
         default_mina = "moudékoukou gnémousséwo"
         out = {"reply": default_mina, "row_id": None}
@@ -379,6 +394,7 @@ def api_chat(inp: ChatIn):
                 "via": via,
                 "mode_audio_only": HARD_AUDIO_ONLY,
                 "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+                "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
                 "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
                 "baseLang": base_lang,
                 "audio_candidates": audio_candidates_dbg,
@@ -406,7 +422,6 @@ def api_chat(inp: ChatIn):
     r = final_hit["row"]
     rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
 
-    # mapping réponse (inchangé)
     if inp.mode == "exchange" or tgt_lang == "same":
         reply = rs or tx or fr or en or ""
     else:
@@ -431,30 +446,30 @@ def api_chat(inp: ChatIn):
             "via": via,
             "mode_audio_only": HARD_AUDIO_ONLY,
             "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+            "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
             "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
             "baseLang": base_lang,
             "best_text": None if not best_text else {
                 "row_id": best_text["row"].get("id"),
-                "score": round(best_text["score"],4)
+                "score": round(best_text["score"], 4)
             },
             "best_audio": None if not best_audio else {
                 "row_id": best_audio["row"].get("id"),
-                "score": round(best_audio["score"],4)
+                "score": round(best_audio["score"], 4)
             },
             "audio_candidates": audio_candidates_dbg,
             "chosen_row_id": r.get("id")
         }
     return out
 
-
-# ------------------------- Collect -------------------------
-# ------------------------- Collect (avec audio_embedding) -------------------------
+# ------------------------------------------------------------------
+# Collect — insert + embeddings (texte + audio)
+# ------------------------------------------------------------------
 @app.post("/api/collect")
 def api_collect(inp: CollectIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # 1) Préparer les champs de base
     row = {
         "lang": (inp.lang or "").lower(),
         "category": (inp.category or "").strip() or None,
@@ -466,48 +481,38 @@ def api_collect(inp: CollectIn):
         "filename": (inp.filename or "").strip() or None,
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        # tu as une colonne mfcc -> si tu veux stocker le JSON du front (optionnel)
-        "mfcc": None,
+        # utile pour piloter l’activation
+        "is_enabled": True
     }
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
 
-    # 2) Embedding texte (si clé OpenAI OK)
+    # Embedding texte
     try:
         vec = embed_text(row["text"])
         if vec:
-            row["embedding"] = vec   # colonne 'embedding'
+            row["embedding"] = vec
     except Exception as e:
         print("embed_text error:", e)
 
-    # 3) Audio → embedding via worker (si audio dataURL fourni)
-    audio_vec = None
-    if isinstance(inp.audio, str) and inp.audio.startswith("data:"):
+    # Embedding audio (si audio present)
+    if inp.audio and isinstance(inp.audio, str) and inp.audio.startswith("data:") and USE_AUDIO_EMB:
         try:
-            audio_vec = _embedding_via_worker(inp.audio)
-            if audio_vec:
-                row["audio_embedding"] = audio_vec   # colonne 'audio_embedding'
+            avec = _embedding_via_worker(inp.audio)
+            if avec:
+                row["audio_embedding"] = avec
+                # on peut stocker “url”=None, “path”/“storage_path” gérés ailleurs si besoin
         except Exception as e:
-            print("audio worker error:", e)
+            print("audio_embedding error:", e)
 
-    # 4) MFCC (optionnel) si tu veux logger ce que t'envoie le front
-    #    -> dans collect.html on calcule 'mfcc' (centroid mean/std), tu peux le recevoir
-    #       Ajoute-le dans le schema CollectIn si tu veux le passer depuis le front.
-    # row["mfcc"] = inp.mfcc  # activate si CollectIn contient mfcc: Optional[dict]
-
-    # 5) Insert
-    try:
-        res = supabase.table("audio_meta").insert(row).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Insert échoué: {e}")
-
+    res = supabase.table("audio_meta").insert(row).execute()
     if not res.data:
-        raise HTTPException(status_code=500, detail="Insert sans data")
+        raise HTTPException(status_code=500, detail="Insert échoué")
+    return {"ok": True, "id": res.data[0]["id"]}
 
-    return {"ok": True, "id": res.data[0]["id"], "has_audio_emb": bool(audio_vec)}
-
-
-# ------------------------- Learn -------------------------
+# ------------------------------------------------------------------
+# Learn
+# ------------------------------------------------------------------
 @app.post("/api/learn")
 def api_learn(inp: LearnIn):
     if supabase is None:
@@ -525,7 +530,9 @@ def api_learn(inp: LearnIn):
         raise HTTPException(status_code=500, detail="Insert events échoué")
     return {"ok": True, "inserted": res.data[0]}
 
-# ------------------------- STT (Whisper) -------------------------
+# ------------------------------------------------------------------
+# STT (Whisper)
+# ------------------------------------------------------------------
 @app.post("/api/stt")
 def api_stt(payload: Dict[str, Any]):
     if not openai_client:
@@ -573,7 +580,9 @@ def api_stt(payload: Dict[str, Any]):
         try: os.remove(tmp_path)
         except: pass
 
-# ------------------------- Nearby via OSM -------------------------
+# ------------------------------------------------------------------
+# OSM Nearby
+# ------------------------------------------------------------------
 def _haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
     dlat = math.radians(lat2-lat1)
@@ -590,7 +599,6 @@ def _osm_query_for(kind: str) -> str:
                'node["amenity"="clinic"](around:{rad},{lat},{lon});' \
                'node["amenity"="doctors"](around:{rad},{lat},{lon});' \
                ');'
-    # food
     return '(' \
            'node["amenity"="restaurant"](around:{rad},{lat},{lon});' \
            'node["amenity"="cafe"](around:{rad},{lat},{lon});' \
@@ -599,7 +607,6 @@ def _osm_query_for(kind: str) -> str:
            ');'
 
 def _osm_nearby(kind: str, lat: float, lon: float, radius: int) -> List[dict]:
-    # Overpass
     q_body = f"""
     [out:json][timeout:25];
     {_osm_query_for(kind).format(lat=lat, lon=lon, rad=radius)}
@@ -615,7 +622,7 @@ def _osm_nearby(kind: str, lat: float, lon: float, radius: int) -> List[dict]:
 
     out = []
     for el in data.get("elements", []):
-        if el.get("type") != "node": 
+        if el.get("type") != "node":
             continue
         tags = el.get("tags", {}) or {}
         name = tags.get("name") or "(sans nom)"
@@ -623,9 +630,7 @@ def _osm_nearby(kind: str, lat: float, lon: float, radius: int) -> List[dict]:
         addr = ", ".join(addr_parts) if addr_parts else None
         lat2, lon2 = float(el["lat"]), float(el["lon"])
         dist = int(_haversine(lat, lon, lat2, lon2))
-        cat = kind
-        if tags.get("amenity"):
-            cat = tags["amenity"]
+        cat = tags.get("amenity") or kind
         out.append({
             "name": name,
             "category": cat,
@@ -649,7 +654,9 @@ def api_nearby(inp: NearbyIn):
         return {"items": [], "notice": "Aucun résultat dans ce rayon."}
     return {"items": items[:25]}
 
-# ------------------------- Audio-embedding util (proxy vers worker) -------------------------
+# ------------------------------------------------------------------
+# Proxy compute embedding (utile pour diag)
+# ------------------------------------------------------------------
 @app.post("/api/compute_audio_embedding")
 def api_compute_audio_embedding(payload: dict):
     if not USE_AUDIO_EMB:
