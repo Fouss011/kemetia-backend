@@ -32,6 +32,9 @@ AUDIO_SIM_THRESHOLD  = float(os.getenv("AUDIO_SIM_THRESHOLD", "0.60"))  # audio 
 AUDIO_MARGIN_MIN     = float(os.getenv("AUDIO_MARGIN_MIN", "0.08"))     # marge entre #1 et #2
 HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"         # audio prioritaire (ignore texte)
 
+# Message défaut
+NOT_UNDERSTOOD = "moudekoukou gnémousséwo"
+
 # Clients
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
@@ -383,10 +386,9 @@ def api_chat(inp: ChatIn):
         final_hit = {"row": best_text["row"], "score": best_text["score"]}
         via = "embed"
 
-    # (4) Réponse
+    # 4) Réponse (STRICT : on ne renvoie pas “n’importe quoi”)
     if not final_hit:
-        default_mina = "moudékoukou gnémousséwo"
-        out = {"reply": default_mina, "row_id": None}
+        out = {"reply": NOT_UNDERSTOOD, "row_id": None}
         if inp.debug:
             out["debug"] = {
                 "from_audio": bool(inp.from_audio),
@@ -394,7 +396,6 @@ def api_chat(inp: ChatIn):
                 "via": via,
                 "mode_audio_only": HARD_AUDIO_ONLY,
                 "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-                "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
                 "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
                 "baseLang": base_lang,
                 "audio_candidates": audio_candidates_dbg,
@@ -419,25 +420,57 @@ def api_chat(inp: ChatIn):
             pass
         return out
 
-    r = final_hit["row"]
-    rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
+    # COM2 : champs propres
+    r  = final_hit["row"]
+    tx = (r.get("text") or "").strip()
+    rs = (r.get("reply_same") or "").strip()
+    fr = (r.get("fr") or "").strip()
+    en = (r.get("en") or "").strip()
 
-    if inp.mode == "exchange" or tgt_lang == "same":
-        reply = rs or tx or fr or en or ""
+    # COM3 : mapping STRICT
+    reply = None
+    if inp.mode == "exchange":
+        # En échange, on DOIT répondre reply_same
+        reply = rs or None
     else:
-        if src_lang == "fr":
-            if tgt_lang in {"mina","bm","ee","ha","sw"}:
-                reply = tx or rs or en or fr or ""
-            elif tgt_lang == "en":
-                reply = en or fr or tx or rs or ""
-            else:
-                reply = fr or ""
+        # translate strict
+        if tgt_lang == "fr":
+            reply = fr or None
+        elif tgt_lang == "en":
+            reply = en or None
+        elif tgt_lang in {"mina", "bm", "ee", "ha", "sw"}:
+            # vers langue locale → text (ou reply_same si text absent)
+            reply = tx or rs or None
         else:
-            if   tgt_lang == "fr": reply = fr or tx or rs or en or ""
-            elif tgt_lang == "en": reply = en or fr or tx or rs or ""
-            elif tgt_lang == src_lang: reply = tx or rs or fr or en or ""
-            else: reply = tx or rs or fr or en or ""
+            reply = fr or en or None
 
+    # Si rien de valide → défaut
+    if not reply:
+        out = {"reply": NOT_UNDERSTOOD, "row_id": None}
+        if inp.debug:
+            out["debug"] = {
+                "from_audio": bool(inp.from_audio),
+                "has_text": bool(user_text),
+                "via": via,
+                "mode_audio_only": HARD_AUDIO_ONLY,
+                "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
+                "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
+                "baseLang": base_lang,
+                "best_text": None if not best_text else {
+                    "row_id": best_text["row"].get("id"),
+                    "score": round(best_text["score"], 4)
+                },
+                "best_audio": None if not best_audio else {
+                    "row_id": best_audio["row"].get("id"),
+                    "score": round(best_audio["score"], 4)
+                },
+                "audio_candidates": audio_candidates_dbg,
+                "chosen_row_id": r.get("id"),
+                "note": "strict mapping: missing required field for this mode"
+            }
+        return out
+
+    # Réponse OK
     out = {"reply": reply, "row_id": r.get("id")}
     if inp.debug:
         out["debug"] = {
@@ -446,7 +479,6 @@ def api_chat(inp: ChatIn):
             "via": via,
             "mode_audio_only": HARD_AUDIO_ONLY,
             "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-            "AUDIO_MARGIN_MIN": AUDIO_MARGIN_MIN,
             "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
             "baseLang": base_lang,
             "best_text": None if not best_text else {
@@ -481,7 +513,6 @@ def api_collect(inp: CollectIn):
         "filename": (inp.filename or "").strip() or None,
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
-        # utile pour piloter l’activation
         "is_enabled": True
     }
     if not row["text"]:
@@ -501,7 +532,6 @@ def api_collect(inp: CollectIn):
             avec = _embedding_via_worker(inp.audio)
             if avec:
                 row["audio_embedding"] = avec
-                # on peut stocker “url”=None, “path”/“storage_path” gérés ailleurs si besoin
         except Exception as e:
             print("audio_embedding error:", e)
 
