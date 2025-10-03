@@ -1,18 +1,25 @@
-pip==24.3.1
+pip>=24.2
 setuptools<70
-fastapi
-uvicorn[standard]
-pydantic<2.0
-python-dotenv
-supabase
-requests
-scipy
-openai>=1.0.0
-python-multipart
-ffmpeg-python
-# --- audio embed stack (compat Py3.11) ---
-numpy<2.0
-numba<0.59
-librosa==0.10.1
-soundfile==0.12.1
-openl3==0.4.2
+
+# FastAPI + Pydantic v2
+fastapi>=0.110,<0.115
+uvicorn[standard]>=0.23,<1
+pydantic>=2.3,<3
+pydantic-core>=2.14,<3
+
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+
+# OpenAI SDK v1 (tu utilises from openai import OpenAI)
+openai>=1.30.0,<2
+
+# Supabase client v2 et deps
+supabase>=2.5.1,<3
+postgrest>=0.13,<1
+httpx>=0.24,<0.28
+
+# Uploads (si tu acceptes des fichiers multipart/form-data un jour)
+python-multipart>=0.0.7,<0.0.10
+
+typing-extensions>=4.8,<5
+
