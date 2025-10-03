@@ -94,9 +94,7 @@ def soft_canon(s: str) -> str:
     t = re.sub(r"[^a-z0-9\s]", "", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
-@app.get("/warmup")
-def warmup():
-    return {"ok": True}
+
 
 @app.get("/health_plus")
 def health_plus():
@@ -109,6 +107,10 @@ def health_plus():
         "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
         "AUDIO_FORCE": AUDIO_FORCE,
     }
+
+@app.get("/warmup")
+def warmup():
+    return {"ok": True}
 
 # ------------------------- OpenAI Embeddings (texte) -------------------------
 EMB_MODEL = "text-embedding-3-small"
