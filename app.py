@@ -645,6 +645,26 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
 
     return {"ok": True, "published": True, "event_id": ins.data[0]["id"]}
 
+# ---- ADMIN: lister les propositions en attente ----
+@app.get("/api/events_admin/pending")
+def api_events_admin_pending(request: Request, limit: int = 200):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    token = auth.replace("Bearer", "").strip()
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    res = (
+        supabase.table("event_submissions")
+        .select("id,title,description,city,venue_name,address,lat,lon,start_time,end_time,price,visibility,contact_phone,contact_url,cover_url,accepted,admin_note,created_at")
+        .is_("accepted", None)
+        .order("created_at", desc=True)
+        .limit(max(1, min(limit, 500)))
+        .execute()
+    )
+    return {"items": res.data or []}
+
 # ------------------------- Audio embedding proxy -------------------------
 @app.post("/api/compute_audio_embedding")
 def api_compute_audio_embedding(payload: dict):
