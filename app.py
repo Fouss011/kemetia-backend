@@ -18,6 +18,9 @@ from fastapi import UploadFile, File, Header
 from uuid import uuid4
 from typing import Optional
 from pydantic import BaseModel
+from io import BytesIO
+
+
 # ------------------------- Config -------------------------
 load_dotenv()
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
@@ -501,6 +504,8 @@ def _require_admin(authorization: Optional[str]):
 class EventId(BaseModel):
     event_id: int
 
+from io import BytesIO
+
 @app.post("/api/upload_audio")
 async def upload_audio(file: UploadFile = File(...)):
     """
@@ -508,29 +513,32 @@ async def upload_audio(file: UploadFile = File(...)):
     Retourne une URL publique.
     """
     if supabase is None:
-        raise HTTPException(500, "Supabase non configuré")
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
 
     data = await file.read()
     if not data:
-        raise HTTPException(400, "Fichier vide")
+        raise HTTPException(status_code=400, detail="Fichier vide")
 
+    # extension simple
     ext = ".webm"
-    key = f"events/{uuid4()}{ext}"
+    ct = file.content_type or "audio/webm"
+    if "ogg" in ct:  ext = ".ogg"
+    elif "mp3" in ct or "mpeg" in ct: ext = ".mp3"
+    elif "m4a" in ct or "mp4" in ct:  ext = ".m4a"
+    key = f"events/{uuid4().hex}{ext}"
 
     try:
+        # supabase-py accepte bytes ou file-like
         supabase.storage.from_("events-audio").upload(
-            key,
-            data,
-            file_options={
-                "content-type": file.content_type or "audio/webm",
-                "cache-control": "3600",
-                "upsert": "false",
-            },
+            path=key,
+            file=BytesIO(data),
+            file_options={"content-type": ct, "cache-control": "3600", "upsert": "false"},
         )
         public = supabase.storage.from_("events-audio").get_public_url(key)
         return {"url": public}
     except Exception as e:
-        raise HTTPException(500, f"Upload fail: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload fail: {e}")
+
 
 @app.post("/api/events_admin/delete")
 def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
