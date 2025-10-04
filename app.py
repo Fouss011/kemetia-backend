@@ -236,6 +236,7 @@ class EventSubmitIn(BaseModel):
     # NEW: audio
     audio_data: Optional[str] = None     # dataURL (webm/ogg/mp3…)
     audio_duration_ms: Optional[int] = None
+    audio_url: Optional[str] = None 
 
 
 class EventPublishIn(BaseModel):
@@ -392,6 +393,7 @@ def api_chat(inp: ChatIn):
 def api_collect(inp: CollectIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
+
     row = {
         "lang": (inp.lang or "").lower(),
         "category": (inp.category or "").strip() or None,
@@ -406,12 +408,41 @@ def api_collect(inp: CollectIn):
     }
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
+
+    # Embedding texte (comme avant)
     vec = embed_text(row["text"])
     if vec: row["embedding"] = vec
+
+    # Nouveau : audio -> upload + embedding
+    audio_url = None
+    if inp.audio:
+        try:
+            header, b64 = inp.audio.split(",", 1)
+            raw = base64.b64decode(b64)
+            mime = header.split(";")[0].split(":",1)[1]
+            ext = ".webm"
+            if "ogg" in mime: ext = ".ogg"
+            elif "mp3" in mime or "mpeg" in mime: ext = ".mp3"
+            elif "m4a" in mime or "mp4" in mime: ext = ".m4a"
+            name = f"meta/{uuid4().hex}{ext}"
+
+            bucket = supabase.storage.from_("kemetia-audio")  # ⬅ change si autre nom
+            bucket.upload(name, raw, {"content-type": mime, "cache-control": "3600"})
+            audio_url = bucket.get_public_url(name)
+            row["audio_url"] = audio_url
+
+            # embedding audio via worker
+            avec = _embedding_via_worker(inp.audio)
+            if avec:
+                row["audio_embedding"] = avec
+        except Exception as e:
+            print("collect audio fail:", e)
+
     res = supabase.table("audio_meta").insert(row).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert échoué")
-    return {"ok": True, "id": res.data[0]["id"]}
+    return {"ok": True, "id": res.data[0]["id"], "audio_url": audio_url}
+
 
 # ------------------------- Learn (feedback) -------------------------
 @app.post("/api/learn")
@@ -694,37 +725,52 @@ def api_event_detail(event_id: int):
 
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn):
+    """
+    Reçoit une proposition d'évènement.
+    - Si `audio_url` est fourni (upload direct déjà fait côté front), on le stocke tel quel.
+    - Sinon, si `audio_data` (dataURL) est fourni, on l'uploade dans le bucket 'events-audio'.
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-    vis = (inp.visibility or "local").lower()
-    if vis not in ("local","city","national","global"): vis = "local"
 
-    # --- audio (optionnel) : limite 30s, upload storage ---
+    # Normalisation visibilité
+    vis = (inp.visibility or "local").lower()
+    if vis not in ("local", "city", "national", "global"):
+        vis = "local"
+
+    # --- AUDIO (optionnel) ---
     audio_url = None
-    if inp.audio_data:
-        # garde-fou côté serveur
+
+    # (A) Upload déjà fait côté front → on prend l'URL telle quelle
+    if inp.audio_url:
+        audio_url = inp.audio_url
+
+    # (B) Pas d'URL directe mais on a un dataURL → on uploade ici
+    elif inp.audio_data:
+        # garde-fou durée (30 s)
         dur = int(inp.audio_duration_ms or 0)
-        if dur <= 0 or dur > 31000:
+        if dur <= 0 or dur > 31_000:
             raise HTTPException(status_code=400, detail="audio trop long (>30s)")
+
         try:
-            # decode
             header, b64 = inp.audio_data.split(",", 1)
-            import base64, uuid
             raw = base64.b64decode(b64)
-            # extension rapide
+
+            # déduire une extension simple
+            mime = header.split(";")[0].split(":", 1)[1] if ";" in header else "audio/webm"
             ext = ".webm"
-            if "audio/ogg" in header: ext = ".ogg"
-            elif "audio/mp3" in header or "mpeg" in header: ext = ".mp3"
-            elif "audio/mp4" in header or "m4a" in header: ext = ".m4a"
-            name = f"{uuid.uuid4().hex}{ext}"
-            # upload
+            if "ogg" in mime:  ext = ".ogg"
+            elif "mp3" in mime or "mpeg" in mime: ext = ".mp3"
+            elif "m4a" in mime or "mp4" in mime:  ext = ".m4a"
+            name = f"{uuid4().hex}{ext}"
+
             bucket = supabase.storage.from_("events-audio")
-            bucket.upload(name, raw, {"content-type": header.split(";")[0].split(":",1)[1]})
-            # public URL
+            bucket.upload(name, raw, {"content-type": mime, "cache-control": "3600"})
             audio_url = bucket.get_public_url(name)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"upload audio fail: {e}")
 
+    # Données à insérer
     row = {
         "title": (inp.title or "").strip(),
         "title_mina": inp.title_mina,
@@ -733,25 +779,33 @@ def api_event_submit(inp: EventSubmitIn):
         "city": inp.city,
         "venue_name": inp.venue_name,
         "address": inp.address,
-        "lat": inp.lat, "lon": inp.lon,
-        "start_time": inp.start_time, "end_time": inp.end_time,
-        "price": inp.price, "visibility": vis,
-        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url,
+        "lat": inp.lat,
+        "lon": inp.lon,
+        "start_time": inp.start_time,       # attendu ISO string
+        "end_time": inp.end_time,
+        "price": inp.price,                 # texte libre
+        "visibility": vis,
+        "contact_phone": inp.contact_phone,
+        "contact_url": inp.contact_url,
         "cover_url": inp.cover_url,
-        "accepted": None,
-        # stocke aussi l'url dans la soumission, l’admin la poussera vers events.audio_url
-        "audio_url": audio_url
+        "accepted": None,                   # en attente de modération
+        "audio_url": audio_url              # <- résultat des blocs audio ci-dessus (ou None)
     }
+
+    # Validation minimale
     if not row["title"] or not row["start_time"]:
         raise HTTPException(status_code=400, detail="title et start_time requis")
 
     try:
         res = supabase.table("event_submissions").insert(row).execute()
+        if not res.data:
+            raise RuntimeError("Insert proposition échoué (aucune data retournée)")
+        return {"ok": True, "submission_id": res.data[0]["id"]}
+    except HTTPException:
+        raise
     except Exception as e:
-        # debug facultatif
         raise HTTPException(status_code=500, detail=str(e))
-    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
-    return {"ok": True, "submission_id": res.data[0]["id"]}
+
 
 
 
