@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, Header
 from uuid import uuid4
 from typing import Optional
 from pydantic import BaseModel
