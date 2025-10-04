@@ -16,7 +16,7 @@ openai>=1.30.0,<2
 # Supabase client v2 et deps
 supabase==2.6.0
 postgrest==0.15.1
-httpx==0.27.2
+httpx==0.25.2
 
 
 # Uploads (si tu acceptes des fichiers multipart/form-data un jour)
