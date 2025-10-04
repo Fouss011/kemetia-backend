@@ -229,6 +229,11 @@ class EventSubmitIn(BaseModel):
     contact_url: Optional[str] = None
     cover_url: Optional[str] = None
 
+    # NEW: audio
+    audio_data: Optional[str] = None     # dataURL (webm/ogg/mp3…)
+    audio_duration_ms: Optional[int] = None
+
+
 class EventPublishIn(BaseModel):
     submission_id: int
     accept: bool = True
@@ -632,15 +637,37 @@ def api_event_detail(event_id: int):
 
 
 @app.post("/api/event_submit")
-def api_event_submit(inp: EventSubmitIn, request: Request):
+def api_event_submit(inp: EventSubmitIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-
-    debug = (request.query_params.get("debug") == "1")
-
     vis = (inp.visibility or "local").lower()
-    if vis not in ("local","city","national","global"):
-        vis = "local"
+    if vis not in ("local","city","national","global"): vis = "local"
+
+    # --- audio (optionnel) : limite 30s, upload storage ---
+    audio_url = None
+    if inp.audio_data:
+        # garde-fou côté serveur
+        dur = int(inp.audio_duration_ms or 0)
+        if dur <= 0 or dur > 31000:
+            raise HTTPException(status_code=400, detail="audio trop long (>30s)")
+        try:
+            # decode
+            header, b64 = inp.audio_data.split(",", 1)
+            import base64, uuid
+            raw = base64.b64decode(b64)
+            # extension rapide
+            ext = ".webm"
+            if "audio/ogg" in header: ext = ".ogg"
+            elif "audio/mp3" in header or "mpeg" in header: ext = ".mp3"
+            elif "audio/mp4" in header or "m4a" in header: ext = ".m4a"
+            name = f"{uuid.uuid4().hex}{ext}"
+            # upload
+            bucket = supabase.storage.from_("events-audio")
+            bucket.upload(name, raw, {"content-type": header.split(";")[0].split(":",1)[1]})
+            # public URL
+            audio_url = bucket.get_public_url(name)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"upload audio fail: {e}")
 
     row = {
         "title": (inp.title or "").strip(),
@@ -650,32 +677,26 @@ def api_event_submit(inp: EventSubmitIn, request: Request):
         "city": inp.city,
         "venue_name": inp.venue_name,
         "address": inp.address,
-        "lat": inp.lat,
-        "lon": inp.lon,
-        "start_time": inp.start_time,
-        "end_time": inp.end_time,
-        "price": inp.price,
-        "visibility": vis,
-        "contact_phone": inp.contact_phone,
-        "contact_url": inp.contact_url,
-        "cover_url": inp.cover_url
-        # NE PAS mettre "accepted" ici → null par défaut
+        "lat": inp.lat, "lon": inp.lon,
+        "start_time": inp.start_time, "end_time": inp.end_time,
+        "price": inp.price, "visibility": vis,
+        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url,
+        "cover_url": inp.cover_url,
+        "accepted": None,
+        # stocke aussi l'url dans la soumission, l’admin la poussera vers events.audio_url
+        "audio_url": audio_url
     }
-
     if not row["title"] or not row["start_time"]:
-        msg = "title et start_time requis"
-        if debug: return {"ok": False, "error": msg, "row": row}
-        raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=400, detail="title et start_time requis")
 
     try:
         res = supabase.table("event_submissions").insert(row).execute()
-        if not res.data:
-            if debug: return {"ok": False, "error": "insert vide", "row": row}
-            raise HTTPException(status_code=500, detail="Insert proposition échoué")
-        return {"ok": True, "submission_id": res.data[0]["id"]}
     except Exception as e:
-        if debug: return {"ok": False, "error": f"{e!r}", "row": row}
-        raise HTTPException(status_code=500, detail="Insert proposition échoué")
+        # debug facultatif
+        raise HTTPException(status_code=500, detail=str(e))
+    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
+    return {"ok": True, "submission_id": res.data[0]["id"]}
+
 
 
 @app.get("/api/submissions_probe")
@@ -770,7 +791,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
             "title","title_mina","description","description_mina",
             "city","venue_name","address","lat","lon",
             "start_time","end_time","price","visibility",
-            "contact_phone","contact_url","cover_url"
+            "contact_phone","contact_url","cover_url","audio_url"
         ]}
         pub["is_published"] = True
         ins = supabase.table("events").insert(pub).execute()
