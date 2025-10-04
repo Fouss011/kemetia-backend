@@ -244,8 +244,8 @@ class EventId(BaseModel):
 # ====== RÈGLES MINA (intents simples) ======
 INTRO_MINA = (
     "Woezon kaka ! Moudogbélo, oyonambé Vapayi ! "
-    "Olé dji pharmacie alo restaurant wo késolégbowoa alo kondji ya, "
-    "né olidji hotel né adon alon tchan biyom pkoua ma soè dodawo ! Akpé !"
+    "Olé dji pharmacie, alo restaurantwo késolégbowoa, alo kondji ya, "
+    "né olidji hotel né adon alon tchan, biyom pkoua ma soè dodawo ! Akpé !"
 )
 
 FALLBACK_MINA = (
