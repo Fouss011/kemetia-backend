@@ -14,6 +14,10 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
+from fastapi import UploadFile, File
+from uuid import uuid4
+from typing import Optional
+from pydantic import BaseModel
 # ------------------------- Config -------------------------
 load_dotenv()
 SUPABASE_URL         = os.getenv("SUPABASE_URL", "")
@@ -456,6 +460,58 @@ def api_stt(payload: Dict[str, Any]):
         try: os.remove(tmp_path)
         except: pass
 
+# Si tu as déjà _require_admin(authorization) garde-le. Sinon un mini stub :
+def _require_admin(authorization: Optional[str]):
+    # Remplace par ta vraie vérif (même logique que /api/events_admin/publish)
+    if not authorization or not authorization.startswith("Bearer "):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+class EventId(BaseModel):
+    event_id: int
+
+@app.post("/api/upload_audio")
+async def upload_audio(file: UploadFile = File(...)):
+    """
+    Reçoit un fichier audio (multipart) et le range dans le bucket 'events-audio'.
+    Retourne une URL publique.
+    """
+    if supabase is None:
+        raise HTTPException(500, "Supabase non configuré")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Fichier vide")
+
+    ext = ".webm"
+    key = f"events/{uuid4()}{ext}"
+
+    try:
+        supabase.storage.from_("events-audio").upload(
+            key,
+            data,
+            file_options={
+                "content-type": file.content_type or "audio/webm",
+                "cache-control": "3600",
+                "upsert": "false",
+            },
+        )
+        public = supabase.storage.from_("events-audio").get_public_url(key)
+        return {"url": public}
+    except Exception as e:
+        raise HTTPException(500, f"Upload fail: {e}")
+
+@app.post("/api/events_admin/delete")
+def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
+    """
+    Suppression d’un évènement par ID (admin).
+    """
+    _require_admin(authorization)
+    try:
+        supabase.table("events").delete().eq("id", req.event_id).execute()
+        return {"ok": True, "deleted_id": req.event_id}
+    except Exception as e:
+        raise HTTPException(500, f"delete fail: {e}")
 # ------------------------- Nearby (OSM) -------------------------
 def _osm_query_for(kind: str) -> str:
     if kind == "pharmacy":
