@@ -6,20 +6,14 @@ from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
-
-from fastapi import UploadFile, File, Header
 from uuid import uuid4
-from typing import Optional
-from pydantic import BaseModel
-from io import BytesIO
-
 
 # ------------------------- Config -------------------------
 load_dotenv()
@@ -235,17 +229,90 @@ class EventSubmitIn(BaseModel):
     contact_phone: Optional[str] = None
     contact_url: Optional[str] = None
     cover_url: Optional[str] = None
-
-    # NEW: audio
+    # audio optionnel
     audio_data: Optional[str] = None     # dataURL (webm/ogg/mp3…)
     audio_duration_ms: Optional[int] = None
-    audio_url: Optional[str] = None 
-
 
 class EventPublishIn(BaseModel):
     submission_id: int
     accept: bool = True
     admin_note: Optional[str] = None
+
+class EventId(BaseModel):
+    event_id: int
+
+# ====== RÈGLES MINA (intents simples) ======
+INTRO_MINA = (
+    "Woezon kaka ! Moudogbélo, oyonambé Vapayi ! "
+    "Olé dji pharmacie alo restaurant wo késolégbowoa alo kondji ya, "
+    "né olidji hotel né adon alon tchan biyom pkoua ma soè dodawo ! Akpé !"
+)
+
+FALLBACK_MINA = (
+    "moudékoukou gnémoukpolé wo édowanwo ! "
+    "néolé dji pharmacie alo restaurant alo hotel, noudoudou tchan maté sowososawo apké!"
+)
+
+PHRASES_MINA = {
+    "pharmacy": {
+        "patterns": [
+            "moulédji pharmacie",
+            "ma plé atiké",
+            "ma plé atchiké",
+            "atiké",
+            "moulé djila plé atiké",
+            "pharmacie",
+            "fikayé ma pko pharmacie léwo",
+        ],
+        "response": (
+            "Yo, ma so pharmacie kéwo solé gbowoua dodawo fifidjin. "
+            "Alo zi bouton ké yé djiyé atikékui léya ola pko pharmacie wo !"
+        ),
+    },
+    "restaurant": {
+        "patterns": [
+            "adoléwoum",
+            "adodéléwoumadé",
+            "maplé nou ladou",
+            "ma plé noudoudou",
+            "moulédji restaurant wo",
+            "restaurant",
+            "ma plé éza",
+            "éza",
+            "noudoudou",
+            "restaurant chic",
+        ],
+        "response": (
+            "Yo, ma so restaurant kéwo solé gbowoua dodawo fifidjin. "
+            "Alo zi bouton ké yé djiyé noudoudou léya ola pko noudoudou sapéwo !"
+        ),
+    },
+    "hotel": {
+        "patterns": [
+            "alon lésom",
+            "moulé djila don alon",
+            "fikayé maté pko hotel léwo",
+            "moulédji hotel",
+            "moulédji motel",
+            "hotel",
+            "motel",
+            "ma mlouagni",
+        ],
+        "response": (
+            "Yo, ma so hotel alo motel kéwo solé gbowoua dodawo fifidjin. "
+            "Alo zi bouton ké yé djiyé abati léya ola pko hotelwo késo légbowoa !"
+        ),
+    },
+}
+
+def _match_intent_mina(text: str):
+    """Retourne ('pharmacy'|'restaurant'|'hotel', response) ou (None, None)."""
+    q = nk(text)
+    for intent, cfg in PHRASES_MINA.items():
+        for pat in cfg["patterns"]:
+            if nk(pat) in q or q in nk(pat):
+                return intent, cfg["response"]
+    return None, None
 
 # ------------------------- Debug audio-match -------------------------
 @app.post("/api/debug_audio_match")
@@ -265,131 +332,24 @@ def api_debug_audio_match(inp: DebugAudioIn):
     for r in rows: r["sim"] = 1.0 - float(r.get("distance", 1.0))
     return {"candidates": rows[:inp.limit]}
 
-# ------------------------- Chat (audio-first) -------------------------
+# ------------------------- Chat (règles Mina simplifiées) -------------------------
 @app.post("/api/chat")
 def api_chat(inp: ChatIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
+    # 0) INTRO FORCÉE si aucun texte (appel initial du front)
     user_text = (inp.text or "").strip()
-    src_lang  = (inp.sourceLang or "mina").lower()
-    tgt_lang  = (inp.targetLang or "fr").lower()
-    base_lang = src_lang if src_lang != "fr" else tgt_lang
-    if base_lang not in {"mina","bm","ee","ha","sw","fr","en"}: base_lang = "mina"
+    if user_text == "" and not inp.from_audio:
+        return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
 
-    best_text = None
-    best_audio = None
-    audio_candidates_dbg = None
+    # 1) INTENTS MINA (règles locales, prioritaire)
+    intent, rule_reply = _match_intent_mina(user_text)
+    if intent and rule_reply:
+        return {"reply": rule_reply, "row_id": None, "mode": f"rule:{intent}"}
 
-    if HARD_AUDIO_ONLY:
-        user_text = ""  # on neutralise le texte
-
-    # 1) texte (si autorisé)
-    if user_text and openai_client and not HARD_AUDIO_ONLY:
-        try:
-            qvec = embed_text(user_text)
-            if qvec:
-                rpc = supabase.rpc("match_audio_meta", {
-                    "p_lang": base_lang, "p_query": qvec, "p_limit": 5
-                }).execute()
-                cand = rpc.data or []
-                if cand:
-                    b = cand[0]; sim = 1.0 - float(b.get("distance", 1.0))
-                    best_text = {"row": b, "score": sim, "via": "embed"}
-        except Exception as e:
-            print("rpc match (text) error:", e)
-
-    # 2) audio prioritaire
-    if (inp.from_audio or HARD_AUDIO_ONLY) and inp.audio:
-        try:
-            avec = _embedding_via_worker(inp.audio)
-            if avec and supabase:
-                rpc2 = supabase.rpc("match_audio_by_vector", {
-                    "p_lang": base_lang, "p_query": avec, "p_limit": 5
-                }).execute()
-                cand2 = rpc2.data or []
-                if cand2:
-                    b2   = cand2[0]; sim2 = 1.0 - float(b2.get("distance", 1.0))
-                    best_audio = {"row": b2, "score": sim2, "via": "audio-embed"}
-                    audio_candidates_dbg = [{
-                        "row_id": it.get("id"),
-                        "sim": round(1.0 - float(it.get("distance", 1.0)), 4),
-                        "text": (it.get("text") or "").strip(),
-                        "fr": (it.get("fr") or "").strip(),
-                        "reply_same": (it.get("reply_same") or "").strip(),
-                    } for it in cand2]
-        except Exception as e:
-            print("audio-embed error:", e)
-
-    # 3) arbitrage
-    final_hit, via = None, "fallback"
-    if best_audio and best_audio["score"] >= AUDIO_SIM_THRESHOLD:
-        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}; via = "audio-embed"
-    elif best_audio and HARD_AUDIO_ONLY:
-        final_hit = {"row": best_audio["row"], "score": best_audio["score"]}; via = "audio-embed-forced"
-    elif best_text and not HARD_AUDIO_ONLY and best_text["score"] >= TEXT_SIM_THRESHOLD:
-        final_hit = {"row": best_text["row"], "score": best_text["score"]}; via = "embed"
-
-    # 4) réponse
-    if not final_hit:
-        default_mina = "moudékoukou gnémousséwo"
-        out = {"reply": default_mina, "row_id": None}
-        if inp.debug:
-            out["debug"] = {
-                "from_audio": bool(inp.from_audio),
-                "has_text": bool(user_text),
-                "via": via,
-                "mode_audio_only": HARD_AUDIO_ONLY,
-                "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-                "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
-                "baseLang": base_lang,
-                "audio_candidates": audio_candidates_dbg,
-                "best_text": None if not best_text else {"row_id": best_text["row"].get("id"), "score": round(best_text["score"],4)},
-                "best_audio": None if not best_audio else {"row_id": best_audio["row"].get("id"), "score": round(best_audio["score"],4)},
-                "note": "no match → default"
-            }
-        try:
-            supabase.table("server_logs").insert({
-                "kind": "no_match", "base_lang": base_lang,
-                "meta": {"from_audio": bool(inp.from_audio), "audio_only": HARD_AUDIO_ONLY},
-                "debug": json.dumps(out.get("debug", {}))
-            }).execute()
-        except Exception:
-            pass
-        return out
-
-    r = final_hit["row"]
-    rs, fr, en, tx = (r.get("reply_same") or "").strip(), (r.get("fr") or "").strip(), (r.get("en") or "").strip(), (r.get("text") or "").strip()
-
-    if inp.mode == "exchange" or tgt_lang == "same":
-        reply = rs or tx or fr or en or ""
-    else:
-        if src_lang == "fr":
-            if tgt_lang in {"mina","bm","ee","ha","sw"}: reply = tx or rs or en or fr or ""
-            elif tgt_lang == "en": reply = en or fr or tx or rs or ""
-            else: reply = fr or ""
-        else:
-            if   tgt_lang == "fr": reply = fr or tx or rs or en or ""
-            elif tgt_lang == "en": reply = en or fr or tx or rs or ""
-            elif tgt_lang == src_lang: reply = tx or rs or fr or en or ""
-            else: reply = tx or rs or fr or en or ""
-
-    out = {"reply": reply, "row_id": r.get("id")}
-    if inp.debug:
-        out["debug"] = {
-            "from_audio": bool(inp.from_audio),
-            "has_text": bool(user_text),
-            "via": via,
-            "mode_audio_only": HARD_AUDIO_ONLY,
-            "AUDIO_SIM_THRESHOLD": AUDIO_SIM_THRESHOLD,
-            "TEXT_SIM_THRESHOLD": TEXT_SIM_THRESHOLD,
-            "baseLang": base_lang,
-            "best_text": None if not best_text else {"row_id": best_text["row"].get("id"), "score": round(best_text["score"],4)},
-            "best_audio": None if not best_audio else {"row_id": best_audio["row"].get("id"), "score": round(best_audio["score"],4)},
-            "audio_candidates": audio_candidates_dbg,
-            "chosen_row_id": r.get("id")
-        }
-    return out
+    # 2) FALLBACK MINA si non prévu
+    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "fallback"}
 
 # ------------------------- Collect -------------------------
 @app.post("/api/collect")
@@ -412,7 +372,7 @@ def api_collect(inp: CollectIn):
     if not row["text"]:
         raise HTTPException(status_code=400, detail="text obligatoire")
 
-    # Embedding texte (comme avant)
+    # Embedding texte
     vec = embed_text(row["text"])
     if vec: row["embedding"] = vec
 
@@ -429,7 +389,7 @@ def api_collect(inp: CollectIn):
             elif "m4a" in mime or "mp4" in mime: ext = ".m4a"
             name = f"meta/{uuid4().hex}{ext}"
 
-            bucket = supabase.storage.from_("kemetia-audio")  # ⬅ change si autre nom
+            bucket = supabase.storage.from_("kemetia-audio")  # bucket base audio
             bucket.upload(name, raw, {"content-type": mime, "cache-control": "3600"})
             audio_url = bucket.get_public_url(name)
             row["audio_url"] = audio_url
@@ -445,7 +405,6 @@ def api_collect(inp: CollectIn):
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert échoué")
     return {"ok": True, "id": res.data[0]["id"], "audio_url": audio_url}
-
 
 # ------------------------- Learn (feedback) -------------------------
 @app.post("/api/learn")
@@ -494,17 +453,13 @@ def api_stt(payload: Dict[str, Any]):
         try: os.remove(tmp_path)
         except: pass
 
-# Si tu as déjà _require_admin(authorization) garde-le. Sinon un mini stub :
+# ------------------------- Admin helpers -------------------------
 def _require_admin(authorization: Optional[str]):
-    # Remplace par ta vraie vérif (même logique que /api/events_admin/publish)
     if not authorization or not authorization.startswith("Bearer "):
-        from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-class EventId(BaseModel):
-    event_id: int
-
-from io import BytesIO
+    token = authorization.replace("Bearer", "").strip()
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.post("/api/upload_audio")
 async def upload_audio(file: UploadFile = File(...)):
@@ -513,44 +468,46 @@ async def upload_audio(file: UploadFile = File(...)):
     Retourne une URL publique.
     """
     if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase non configuré")
+        raise HTTPException(500, "Supabase non configuré")
 
     data = await file.read()
     if not data:
-        raise HTTPException(status_code=400, detail="Fichier vide")
+        raise HTTPException(400, "Fichier vide")
 
-    # extension simple
+    # choisir extension simple depuis le mime
     ext = ".webm"
     ct = file.content_type or "audio/webm"
-    if "ogg" in ct:  ext = ".ogg"
+    if "ogg" in ct: ext = ".ogg"
     elif "mp3" in ct or "mpeg" in ct: ext = ".mp3"
-    elif "m4a" in ct or "mp4" in ct:  ext = ".m4a"
-    key = f"events/{uuid4().hex}{ext}"
+    elif "m4a" in ct or "mp4" in ct: ext = ".m4a"
+
+    key = f"events/{uuid4()}{ext}"
 
     try:
-        # supabase-py accepte bytes ou file-like
         supabase.storage.from_("events-audio").upload(
-            path=key,
-            file=BytesIO(data),
-            file_options={"content-type": ct, "cache-control": "3600", "upsert": "false"},
+            key,
+            data,
+            file_options={
+                "content-type": ct,
+                "cache-control": "3600",
+                "upsert": "false",
+            },
         )
         public = supabase.storage.from_("events-audio").get_public_url(key)
         return {"url": public}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload fail: {e}")
-
+        raise HTTPException(500, f"Upload fail: {e}")
 
 @app.post("/api/events_admin/delete")
 def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
-    """
-    Suppression d’un évènement par ID (admin).
-    """
+    """Suppression d’un évènement par ID (admin)."""
     _require_admin(authorization)
     try:
         supabase.table("events").delete().eq("id", req.event_id).execute()
         return {"ok": True, "deleted_id": req.event_id}
     except Exception as e:
         raise HTTPException(500, f"delete fail: {e}")
+
 # ------------------------- Nearby (OSM) -------------------------
 def _osm_query_for(kind: str) -> str:
     if kind == "pharmacy":
@@ -607,7 +564,6 @@ def _fmt_price(amount, currency, text_fallback=None):
         pass
     return (text_fallback or None)
 
-
 @app.post("/api/events_public")
 def api_events_public(q: EventsQuery, request: Request):
     """
@@ -636,11 +592,10 @@ def api_events_public(q: EventsQuery, request: Request):
         except: return None
 
     try:
-        # 1) lecture brute de la vue (pas de gte/lte)
         raw = (
             supabase.table("events_api")
             .select(FIELDS)
-            .order("starts_at", desc=False)   # tri soft (même si text)
+            .order("starts_at", desc=False)
             .limit(1000)
             .execute()
         ).data or []
@@ -649,20 +604,16 @@ def api_events_public(q: EventsQuery, request: Request):
         raise HTTPException(status_code=500, detail="DB read fail")
 
     try:
-        # 2) normalisation + fenêtre de temps
         normalized = []
         for r in raw:
             dt = parse_iso(r.get("starts_at"))
-            if not dt or not (now <= dt <= max_dt):   # hors fenêtre
+            if not dt or not (now <= dt <= max_dt):
                 continue
-            # prix joli
             r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
-            # ensure iso string
             if isinstance(r.get("starts_at"), datetime):
                 r["starts_at"] = r["starts_at"].isoformat()
             normalized.append(r)
 
-        # 3) split national / local
         nat = [r for r in normalized if bool(r.get("is_national"))]
         nat.sort(key=lambda r: (r.get("starts_at") or ""))
 
@@ -685,7 +636,6 @@ def api_events_public(q: EventsQuery, request: Request):
             return {"local": [], "national": [], "now": now.isoformat(), "error": f"postproc fail: {e!r}", "raw_count": len(raw)}
         raise HTTPException(status_code=500, detail="postproc fail")
 
-
 @app.get("/api/events_probe")
 def api_events_probe(limit: int = 5):
     if supabase is None:
@@ -702,11 +652,10 @@ def api_events_probe(limit: int = 5):
     except Exception as e:
         return {"items": [], "error": f"{e!r}"}
 
-
 @app.get("/diag/versions")
 def diag_versions():
     import pkg_resources
-    def v(p): 
+    def v(p):
         try: return pkg_resources.get_distribution(p).version
         except: return None
     return {
@@ -715,8 +664,6 @@ def diag_versions():
         "httpx": v("httpx")
     }
 
-
-
 @app.get("/api/events/{event_id}")
 def api_event_detail(event_id: int):
     if supabase is None:
@@ -724,61 +671,39 @@ def api_event_detail(event_id: int):
     r = supabase.table("events_api").select("*").eq("id", event_id).limit(1).execute()
     it = (r.data or [None])[0]
     if not it: raise HTTPException(status_code=404, detail="Event not found")
-    # Normalise le prix pour l’affichage si besoin
     it["price_display"] = _fmt_price(it.get("price_amount"), it.get("price_currency"), it.get("price_text"))
     if isinstance(it.get("starts_at"), datetime):
         it["starts_at"] = it["starts_at"].isoformat()
     return it
 
-
+# ------------------------- Submit Event -------------------------
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn):
-    """
-    Reçoit une proposition d'évènement.
-    - Si `audio_url` est fourni (upload direct déjà fait côté front), on le stocke tel quel.
-    - Sinon, si `audio_data` (dataURL) est fourni, on l'uploade dans le bucket 'events-audio'.
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-
-    # Normalisation visibilité
     vis = (inp.visibility or "local").lower()
-    if vis not in ("local", "city", "national", "global"):
-        vis = "local"
+    if vis not in ("local","city","national","global"): vis = "local"
 
-    # --- AUDIO (optionnel) ---
+    # audio (optionnel) : limite 30s, upload storage
     audio_url = None
-
-    # (A) Upload déjà fait côté front → on prend l'URL telle quelle
-    if inp.audio_url:
-        audio_url = inp.audio_url
-
-    # (B) Pas d'URL directe mais on a un dataURL → on uploade ici
-    elif inp.audio_data:
-        # garde-fou durée (30 s)
+    if inp.audio_data:
         dur = int(inp.audio_duration_ms or 0)
-        if dur <= 0 or dur > 31_000:
+        if dur <= 0 or dur > 31000:
             raise HTTPException(status_code=400, detail="audio trop long (>30s)")
-
         try:
             header, b64 = inp.audio_data.split(",", 1)
             raw = base64.b64decode(b64)
-
-            # déduire une extension simple
-            mime = header.split(";")[0].split(":", 1)[1] if ";" in header else "audio/webm"
             ext = ".webm"
-            if "ogg" in mime:  ext = ".ogg"
-            elif "mp3" in mime or "mpeg" in mime: ext = ".mp3"
-            elif "m4a" in mime or "mp4" in mime:  ext = ".m4a"
+            if "audio/ogg" in header: ext = ".ogg"
+            elif "audio/mp3" in header or "mpeg" in header: ext = ".mp3"
+            elif "audio/mp4" in header or "m4a" in header: ext = ".m4a"
             name = f"{uuid4().hex}{ext}"
-
             bucket = supabase.storage.from_("events-audio")
-            bucket.upload(name, raw, {"content-type": mime, "cache-control": "3600"})
+            bucket.upload(name, raw, {"content-type": header.split(";")[0].split(":",1)[1]})
             audio_url = bucket.get_public_url(name)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"upload audio fail: {e}")
 
-    # Données à insérer
     row = {
         "title": (inp.title or "").strip(),
         "title_mina": inp.title_mina,
@@ -787,35 +712,23 @@ def api_event_submit(inp: EventSubmitIn):
         "city": inp.city,
         "venue_name": inp.venue_name,
         "address": inp.address,
-        "lat": inp.lat,
-        "lon": inp.lon,
-        "start_time": inp.start_time,       # attendu ISO string
-        "end_time": inp.end_time,
-        "price": inp.price,                 # texte libre
-        "visibility": vis,
-        "contact_phone": inp.contact_phone,
-        "contact_url": inp.contact_url,
+        "lat": inp.lat, "lon": inp.lon,
+        "start_time": inp.start_time, "end_time": inp.end_time,
+        "price": inp.price, "visibility": vis,
+        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url,
         "cover_url": inp.cover_url,
-        "accepted": None,                   # en attente de modération
-        "audio_url": audio_url              # <- résultat des blocs audio ci-dessus (ou None)
+        "accepted": None,
+        "audio_url": audio_url,
     }
-
-    # Validation minimale
     if not row["title"] or not row["start_time"]:
         raise HTTPException(status_code=400, detail="title et start_time requis")
 
     try:
         res = supabase.table("event_submissions").insert(row).execute()
-        if not res.data:
-            raise RuntimeError("Insert proposition échoué (aucune data retournée)")
-        return {"ok": True, "submission_id": res.data[0]["id"]}
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
+    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
+    return {"ok": True, "submission_id": res.data[0]["id"]}
 
 @app.get("/api/submissions_probe")
 def submissions_probe(limit: int = 5):
@@ -833,11 +746,9 @@ def submissions_probe(limit: int = 5):
 
 @app.get("/api/submissions_columns")
 def submissions_columns():
-    # Liste les colonnes vues par PostgREST (utile si erreur de schéma)
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     try:
-        # PostgREST n’a pas d’endpoint “describe”, on tente une ligne vide
         rows = (supabase.table("event_submissions")
                 .select("*")
                 .limit(1)
@@ -847,7 +758,7 @@ def submissions_columns():
     except Exception as e:
         return {"columns": None, "error": f"{e!r}"}
 
-# ---- ADMIN: lister les propositions en attente (debug-friendly) ----
+# ---- ADMIN: lister les propositions en attente ----
 @app.get("/api/events_admin/pending")
 def api_events_admin_pending(request: Request, limit: int = 200):
     if supabase is None:
@@ -864,8 +775,6 @@ def api_events_admin_pending(request: Request, limit: int = 200):
              .select("*")
              .order("created_at", desc=True)
              .limit(max(1, min(limit, 500))))
-        # filtre accepted IS NULL si la colonne existe
-        # (elle existe après le SQL ci-dessus)
         q = q.is_("accepted", None)
         res = q.execute()
         return {"items": res.data or []}
@@ -873,20 +782,17 @@ def api_events_admin_pending(request: Request, limit: int = 200):
         if debug: return {"items": [], "error": f"{e!r}"}
         raise HTTPException(status_code=500, detail="DB error")
 
-
-# ---- ADMIN: publier/refuser une proposition (debug-friendly) ----
+# ---- ADMIN: publier/refuser une proposition ----
 @app.post("/api/events_admin/publish")
 def api_events_admin_publish(inp: EventPublishIn, request: Request):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # Auth admin
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Récupérer la soumission
     r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
     sub = (r.data or [None])[0]
     if not sub:
@@ -907,7 +813,6 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     if vis not in ("local","city","national","global"):
         vis = "local"
 
-    # Construire la ligne pour 'events' en respectant SES colonnes (start_time/end_time)
     pub = {
         "title":            sub.get("title"),
         "title_mina":       sub.get("title_mina"),
@@ -918,26 +823,16 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         "address":          sub.get("address"),
         "lat":              sub.get("lat"),
         "lon":              sub.get("lon"),
-
-        # ⬇️ ta table utilise ces noms-ci :
         "start_time":       sub.get("start_time") or None,
         "end_time":         sub.get("end_time")   or None,
-
-        "price":            sub.get("price"),             # ta table a 'price' (texte)
+        "price":            sub.get("price"),
         "visibility":       vis,
         "audio_url":        sub.get("audio_url"),
-
         "is_published":     True,
-        # Coherence si tu as ce bool dans events
         "is_national":      True if vis in ("national","global") else False,
-        # Si ta table a 'location_text'
         "location_text":    (sub.get("venue_name") or sub.get("address") or sub.get("city") or None),
-        # Si ta table a 'price_currency' (défaut)
         "price_currency":   "XOF",
     }
-
-    # Enlever les clés None si la colonne n’existe pas chez toi ne gêne pas PostgREST,
-    # mais pour éviter tout conflit de cache, on peut nettoyer:
     pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
 
     try:
@@ -948,7 +843,6 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     except Exception as e:
         return {"ok": False, "error": f"insert events fail: {e}"}
 
-    # Marquer la soumission comme acceptée
     try:
         supabase.table("event_submissions").update({
             "accepted": True,
@@ -961,10 +855,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
 
     return {"ok": True, "published": True, "event_id": new_id}
 
-
 # ---------- Event short announce (TTS ~30s) ----------
-from functools import lru_cache
-
 def _announce_text(ev: dict) -> str:
     title = (ev.get("title") or "").strip()
     when  = (ev.get("starts_at") or ev.get("start_time") or "").strip()
@@ -981,39 +872,30 @@ def _announce_text(ev: dict) -> str:
 
 @lru_cache(maxsize=256)
 def _tts_b64_for_event(event_id: int) -> str:
-    # retourne base64 MP3 ou lève Exception
     if not openai_client:
         raise RuntimeError("OPENAI_API_KEY manquant")
-    # récupérer l’event
     r = supabase.table("events").select("*").eq("id", event_id).limit(1).execute()
     ev = (r.data or [None])[0]
     if not ev:
         raise RuntimeError("event not found")
     txt = _announce_text(ev)
-    # TTS OpenAI (MP3)
     try:
-        # SDK v1
         speech = openai_client.audio.speech.create(
-            model="gpt-4o-mini-tts",  # sinon "tts-1"
+            model="gpt-4o-mini-tts",
             voice="alloy",
             input=txt,
             format="mp3"
         )
         mp3_bytes = speech.content  # bytes
     except Exception:
-        # fallback API older style (selon version SDK)
         with openai_client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts", voice="alloy", input=txt
         ) as resp:
             mp3_bytes = resp.read()
-    import base64
     return base64.b64encode(mp3_bytes).decode("ascii")
 
 @app.get("/api/event_announce_preview")
 def api_event_announce_preview(event_id: int):
-    """
-    Renvoie un MP3 dataURL (30s max) pour annoncer l’événement.
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     try:
@@ -1021,8 +903,6 @@ def api_event_announce_preview(event_id: int):
         return {"audio": f"data:audio/mpeg;base64,{b64}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS error: {e}")
-
-
 
 # ------------------------- Audio embedding proxy -------------------------
 @app.post("/api/compute_audio_embedding")
