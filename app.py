@@ -461,42 +461,60 @@ def _require_admin(authorization: Optional[str]):
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# --- UPLOAD AUDIO (évènements) ---
 @app.post("/api/upload_audio")
 async def upload_audio(file: UploadFile = File(...)):
     """
-    Reçoit un fichier audio (multipart) et le range dans le bucket 'events-audio'.
+    Reçoit un fichier audio (multipart/form-data, champ 'file')
+    et l’upload dans le bucket Supabase 'kemetia-audio' (dossier events/).
     Retourne une URL publique.
     """
     if supabase is None:
-        raise HTTPException(500, "Supabase non configuré")
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
 
+    # lecture du payload
     data = await file.read()
     if not data:
-        raise HTTPException(400, "Fichier vide")
+        raise HTTPException(status_code=400, detail="Fichier vide")
 
-    # choisir extension simple depuis le mime
+    # extension à partir du content-type
+    ct = (file.content_type or "").lower()
     ext = ".webm"
-    ct = file.content_type or "audio/webm"
-    if "ogg" in ct: ext = ".ogg"
+    if "ogg" in ct:      ext = ".ogg"
     elif "mp3" in ct or "mpeg" in ct: ext = ".mp3"
-    elif "m4a" in ct or "mp4" in ct: ext = ".m4a"
+    elif "m4a" in ct or "mp4" in ct:  ext = ".m4a"
+    elif "wav" in ct:    ext = ".wav"
 
     key = f"events/{uuid4()}{ext}"
 
+    # nom du bucket utilisé PAR TOUT LE PROJET
+    BUCKET = "kemetia-audio"   # ⚠️ crée-le dans Supabase storage si absent
+
     try:
-        supabase.storage.from_("events-audio").upload(
+        # vérifie l’existence du bucket en tentant un upload
+        supabase.storage.from_(BUCKET).upload(
             key,
             data,
             file_options={
-                "content-type": ct,
+                "content-type": ct or "audio/webm",
                 "cache-control": "3600",
                 "upsert": "false",
             },
         )
-        public = supabase.storage.from_("events-audio").get_public_url(key)
-        return {"url": public}
+        public = supabase.storage.from_(BUCKET).get_public_url(key)
+        # sécurité: string attendu
+        if not isinstance(public, str) or not public:
+            raise RuntimeError("public URL vide")
+        return {"url": public, "key": key, "bucket": BUCKET, "content_type": ct}
     except Exception as e:
-        raise HTTPException(500, f"Upload fail: {e}")
+        # aide au debug si le bucket n’existe pas
+        msg = str(e)
+        if "Bucket not found" in msg or "No such bucket" in msg:
+            raise HTTPException(
+                status_code=400,
+                detail="Bucket not found: crée le bucket 'kemetia-audio' dans Supabase Storage (public)"
+            )
+        raise HTTPException(status_code=500, detail=f"Upload fail: {msg}")
 
 @app.post("/api/events_admin/delete")
 def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
