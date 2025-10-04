@@ -1,7 +1,7 @@
-# app.py — Kemetia (FastAPI)
+# app.py — Kemetia (FastAPI, unifiée Oct 2025)
 from __future__ import annotations
 import os, re, json, base64, tempfile, unicodedata, time, math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 
@@ -33,13 +33,17 @@ ADMIN_TOKEN          = os.getenv("ADMIN_TOKEN", "")
 # Clients
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    try: supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    except Exception as e: print("❌ Supabase init error:", e)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        print("❌ Supabase init error:", e)
 
 openai_client = None
 if OPENAI_API_KEY:
-    try: openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e: print("❌ OpenAI init error:", e)
+    try:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print("❌ OpenAI init error:", e)
 
 # App + CORS
 app = FastAPI(title="Kemetia Backend")
@@ -62,7 +66,8 @@ def any_options(full_path: str):
 
 @app.middleware("http")
 async def ensure_cors_headers(request: Request, call_next):
-    try: resp = await call_next(request)
+    try:
+        resp = await call_next(request)
     except Exception as e:
         from fastapi.responses import JSONResponse
         resp = JSONResponse({"detail": "server error", "error": str(e)}, status_code=500)
@@ -200,6 +205,12 @@ class DebugAudioIn(BaseModel):
     limit: int = 5
 
 # Evénements
+class EventsQuery(BaseModel):
+    lat: float | None = None
+    lon: float | None = None
+    radius_m: int = 5000
+    horizon_hours: int = 168   # 7 jours
+
 class EventSubmitIn(BaseModel):
     title: str
     title_mina: Optional[str] = None
@@ -330,7 +341,8 @@ def api_chat(inp: ChatIn):
                 "meta": {"from_audio": bool(inp.from_audio), "audio_only": HARD_AUDIO_ONLY},
                 "debug": json.dumps(out.get("debug", {}))
             }).execute()
-        except Exception: pass
+        except Exception:
+            pass
         return out
 
     r = final_hit["row"]
@@ -383,14 +395,16 @@ def api_collect(inp: CollectIn):
         "mime": (inp.mime or "").strip() or None,
         "duration_ms": inp.duration_ms,
     }
-    if not row["text"]: raise HTTPException(status_code=400, detail="text obligatoire")
+    if not row["text"]:
+        raise HTTPException(status_code=400, detail="text obligatoire")
     vec = embed_text(row["text"])
     if vec: row["embedding"] = vec
     res = supabase.table("audio_meta").insert(row).execute()
-    if not res.data: raise HTTPException(status_code=500, detail="Insert échoué")
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Insert échoué")
     return {"ok": True, "id": res.data[0]["id"]}
 
-# ------------------------- Learn -------------------------
+# ------------------------- Learn (feedback) -------------------------
 @app.post("/api/learn")
 def api_learn(inp: LearnIn):
     if supabase is None:
@@ -400,8 +414,9 @@ def api_learn(inp: LearnIn):
         "input_type": inp.input_type, "correction_text": (inp.correction_text or None),
         "correction_row_id": inp.correction_row_id, "meta": {"ip": None, "ua": "fastapi"}
     }
-    res = supabase.table("events").insert(row).execute()
-    if not res.data: raise HTTPException(status_code=500, detail="Insert events échoué")
+    res = supabase.table("feedback").insert(row).execute()
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Insert feedback échoué")
     return {"ok": True, "inserted": res.data[0]}
 
 # ------------------------- STT (Whisper) -------------------------
@@ -414,7 +429,8 @@ def api_stt(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
     try:
         header, b64 = data_url.split(",", 1); raw = base64.b64decode(b64)
-    except Exception: raise HTTPException(status_code=400, detail="audio invalide")
+    except Exception:
+        raise HTTPException(status_code=400, detail="audio invalide")
     mime = "application/octet-stream"
     try: mime = header.split(";")[0].split(":",1)[1] or mime
     except Exception: pass
@@ -477,77 +493,86 @@ def api_nearby(inp: NearbyIn):
     items = _osm_nearby(kind, float(inp.lat), float(inp.lon), int(inp.radius or 4000))
     return {"items": items[:25]} if items else {"items": [], "notice": "Aucun résultat dans ce rayon."}
 
-# ------------------------- Audio embedding proxy -------------------------
-@app.post("/api/compute_audio_embedding")
-def api_compute_audio_embedding(payload: dict):
-    if not USE_AUDIO_EMB: raise HTTPException(status_code=501, detail="audio-embedding désactivé")
-    data_url = (payload or {}).get("audio") or ""
-    if not (isinstance(data_url, str) and data_url.startswith("data:")):
-        raise HTTPException(status_code=400, detail="audio dataURL requis")
-    vec = _embedding_via_worker(data_url)
-    if not vec: raise HTTPException(status_code=500, detail="embedding vide")
-    return {"embedding": vec, "dim": len(vec)}
+# ------------------------- Événements publics (API unifiée) -------------------------
+def _fmt_price(amount, currency):
+    try:
+        if amount is None:
+            return None
+        a = float(amount)
+        cur = (currency or "").upper() or "XOF"
+        return f"{int(a)} {cur}" if a.is_integer() else f"{a:.0f} {cur}"
+    except Exception:
+        return None
 
-# ------------------------- EVENTS (public + admin) -------------------------
-@app.get("/api/events_public")
-def api_events_public(
-    lat: Optional[float] = None, lon: Optional[float] = None, radius: int = 5000,
-    city: Optional[str] = None, limit: int = 50
-):
+@app.post("/api/events_public")
+def api_events_public(q: EventsQuery):
+    """
+    Renvoie deux listes :
+      - local   : événements à venir dans le rayon (si lat/lon fournis)
+      - national: événements marqués 'is_national = true' à venir (partout)
+    Champs renvoyés: id,title,description,location_text,lat,lon,starts_at,price_display,is_national,audio_url
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-    now = datetime.now(timezone.utc); rows = []
 
-    # Global / national (partout)
-    try:
-        r1 = supabase.table("events").select("*")\
-            .eq("is_published", True)\
-            .in_("visibility", ["global","national"])\
-            .gte("end_time", now.isoformat())\
-            .order("start_time", desc=False).limit(limit).execute()
-        rows += (r1.data or [])
-    except Exception as e: print("events_public global/national error:", e)
+    now = datetime.now(timezone.utc)
+    max_dt = now + timedelta(hours=max(1, min(q.horizon_hours, 24*14)))  # max 14j
 
-    # City
-    if city:
+    # 1) Nationaux
+    nat = (
+        supabase.table("events")
+        .select("id,title,description,location_text,lat,lon,starts_at,is_national,price_amount,price_currency,audio_url")
+        .eq("is_national", True)
+        .gte("starts_at", now.isoformat())
+        .lte("starts_at", max_dt.isoformat())
+        .order("starts_at", desc=False)
+        .limit(50)
+        .execute()
+    ).data or []
+    for r in nat:
+        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"))
         try:
-            r2 = supabase.table("events").select("*")\
-                .eq("is_published", True)\
-                .eq("visibility", "city")\
-                .gte("end_time", now.isoformat())\
-                .order("start_time", desc=False).limit(limit).execute()
-            c_city = canon_city(city)
-            rows += [it for it in (r2.data or []) if canon_city(it.get("city")) == c_city]
-        except Exception as e: print("events_public city error:", e)
+            if isinstance(r.get("starts_at"), datetime):
+                r["starts_at"] = r["starts_at"].isoformat()
+        except:
+            pass
 
-    # Local (rayon)
-    if lat is not None and lon is not None:
-        try:
-            r3 = supabase.table("events").select("*")\
-                .eq("is_published", True)\
-                .eq("visibility", "local")\
-                .gte("end_time", now.isoformat())\
-                .order("start_time", desc=False).limit(200).execute()
-            loc = []
-            for it in (r3.data or []):
-                lt, ln = it.get("lat"), it.get("lon")
-                if lt is None or ln is None: continue
-                try: d = _haversine(float(lat), float(lon), float(lt), float(ln))
-                except Exception: continue
-                if d <= float(max(100, radius)):
-                    it["distance_m"] = int(d); loc.append(it)
-            loc.sort(key=lambda x: x.get("distance_m", 0))
-            rows += loc
-        except Exception as e: print("events_public local error:", e)
+    # 2) Locaux si géoloc fournie
+    loc = []
+    if q.lat is not None and q.lon is not None:
+        base = (
+            supabase.table("events")
+            .select("id,title,description,location_text,lat,lon,starts_at,is_national,price_amount,price_currency,audio_url")
+            .gte("starts_at", now.isoformat())
+            .lte("starts_at", max_dt.isoformat())
+            .order("starts_at", desc=False)
+            .limit(200)
+            .execute()
+        ).data or []
 
-    # dedup + tri + cap
-    seen, unique = set(), []
-    for it in rows:
-        i = it.get("id")
-        if i in seen: continue
-        seen.add(i); unique.append(it)
-    unique.sort(key=lambda x: x.get("start_time") or "")
-    return {"items": unique[:max(1, min(200, limit))]}
+        for r in base:
+            try:
+                lt, ln = float(r["lat"]), float(r["lon"])
+            except Exception:
+                continue
+            d = _haversine(float(q.lat), float(q.lon), lt, ln)
+            if d <= float(q.radius_m or 5000):
+                r["distance_m"] = int(d)
+                r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"))
+                try:
+                    if isinstance(r.get("starts_at"), datetime):
+                        r["starts_at"] = r["starts_at"].isoformat()
+                except:
+                    pass
+                loc.append(r)
+
+        loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
+
+    return {
+        "local": loc[:100],
+        "national": nat[:100],
+        "now": now.isoformat()
+    }
 
 @app.get("/api/events/{event_id}")
 def api_event_detail(event_id: int):
@@ -598,11 +623,20 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
             .eq("id", inp.submission_id).execute()
         return {"ok": True, "published": False}
 
-    pub = {k: sub.get(k) for k in [
-        "title","title_mina","description","description_mina","city","venue_name","address",
-        "lat","lon","start_time","end_time","price","visibility","contact_phone","contact_url","cover_url"
-    ]}
-    pub["is_published"] = True
+    pub = {
+        "title": sub.get("title"),
+        "description": sub.get("description"),
+        "location_text": sub.get("address") or sub.get("venue_name") or sub.get("city"),
+        "city": sub.get("city"),
+        "venue_name": sub.get("venue_name"),
+        "address": sub.get("address"),
+        "lat": sub.get("lat"),
+        "lon": sub.get("lon"),
+        "starts_at": sub.get("start_time"),
+        "ends_at": sub.get("end_time"),
+        "visibility": (sub.get("visibility") or "local").lower(),
+        "audio_url": sub.get("cover_url")
+    }
     ins = supabase.table("events").insert(pub).execute()
     if not ins.data: raise HTTPException(status_code=500, detail="Insert events failed")
 
@@ -610,3 +644,14 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         .eq("id", inp.submission_id).execute()
 
     return {"ok": True, "published": True, "event_id": ins.data[0]["id"]}
+
+# ------------------------- Audio embedding proxy -------------------------
+@app.post("/api/compute_audio_embedding")
+def api_compute_audio_embedding(payload: dict):
+    if not USE_AUDIO_EMB: raise HTTPException(status_code=501, detail="audio-embedding désactivé")
+    data_url = (payload or {}).get("audio") or ""
+    if not (isinstance(data_url, str) and data_url.startswith("data:")):
+        raise HTTPException(status_code=400, detail="audio dataURL requis")
+    vec = _embedding_via_worker(data_url)
+    if not vec: raise HTTPException(status_code=500, detail="embedding vide")
+    return {"embedding": vec, "dim": len(vec)}
