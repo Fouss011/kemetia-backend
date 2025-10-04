@@ -653,65 +653,95 @@ def api_event_submit(inp: EventSubmitIn):
     if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
     return {"ok": True, "submission_id": res.data[0]["id"]}
 
-@app.post("/api/events_admin/publish")
-def api_events_admin_publish(inp: EventPublishIn, request: Request):
-    if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase non configuré")
-    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-    token = auth.replace("Bearer", "").strip()
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
-    sub = (r.data or [None])[0]
-    if not sub: raise HTTPException(status_code=404, detail="Submission not found")
-
-    if not inp.accept:
-        supabase.table("event_submissions").update({"accepted": False, "admin_note": inp.admin_note or "refused"})\
-            .eq("id", inp.submission_id).execute()
-        return {"ok": True, "published": False}
-
-    pub = {
-        "title": sub.get("title"),
-        "description": sub.get("description"),
-        "location_text": sub.get("address") or sub.get("venue_name") or sub.get("city"),
-        "city": sub.get("city"),
-        "venue_name": sub.get("venue_name"),
-        "address": sub.get("address"),
-        "lat": sub.get("lat"),
-        "lon": sub.get("lon"),
-        "starts_at": sub.get("start_time"),
-        "ends_at": sub.get("end_time"),
-        "visibility": (sub.get("visibility") or "local").lower(),
-        "audio_url": sub.get("cover_url")
-    }
-    ins = supabase.table("events").insert(pub).execute()
-    if not ins.data: raise HTTPException(status_code=500, detail="Insert events failed")
-
-    supabase.table("event_submissions").update({"accepted": True, "admin_note": inp.admin_note or "published"})\
-        .eq("id", inp.submission_id).execute()
-
-    return {"ok": True, "published": True, "event_id": ins.data[0]["id"]}
-
-# ---- ADMIN: lister les propositions en attente ----
+# ---- ADMIN: lister les propositions en attente (debug-friendly) ----
 @app.get("/api/events_admin/pending")
 def api_events_admin_pending(request: Request, limit: int = 200):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
+    debug = (request.query_params.get("debug") == "1")
+
+    # Auth
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    res = (
-        supabase.table("event_submissions")
-        .select("id,title,description,city,venue_name,address,lat,lon,start_time,end_time,price,visibility,contact_phone,contact_url,cover_url,accepted,admin_note,created_at")
-        .is_("accepted", None)
-        .order("created_at", desc=True)
-        .limit(max(1, min(limit, 500)))
-        .execute()
-    )
-    return {"items": res.data or []}
+    try:
+        res = (
+            supabase.table("event_submissions")
+            .select("id,title,description,city,venue_name,address,lat,lon,start_time,end_time,price,visibility,contact_phone,contact_url,cover_url,accepted,admin_note,created_at")
+            .is_("accepted", None)
+            .order("created_at", desc=True)
+            .limit(max(1, min(limit, 500)))
+            .execute()
+        )
+        return {"items": res.data or []}
+    except Exception as e:
+        if debug:
+            return {"items": [], "error": f"{e!r}"}
+        raise HTTPException(status_code=500, detail="DB error")
+
+# ---- ADMIN: publier/refuser une proposition (debug-friendly) ----
+@app.post("/api/events_admin/publish")
+def api_events_admin_publish(inp: EventPublishIn, request: Request):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    debug = (request.query_params.get("debug") == "1")
+
+    # Auth
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    token = auth.replace("Bearer", "").strip()
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # lecture submission
+    try:
+        r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
+        sub = (r.data or [None])[0]
+    except Exception as e:
+        if debug:
+            return {"ok": False, "error": f"read submissions fail: {e!r}"}
+        raise HTTPException(status_code=500, detail="read submissions fail")
+
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    # refus ?
+    if not inp.accept:
+        try:
+            supabase.table("event_submissions").update({"accepted": False, "admin_note": inp.admin_note or "refused"}).eq("id", inp.submission_id).execute()
+            return {"ok": True, "published": False}
+        except Exception as e:
+            if debug:
+                return {"ok": False, "error": f"update refuse fail: {e!r}"}
+            raise HTTPException(status_code=500, detail="update refuse fail")
+
+    # publication -> insérer dans events (ton schéma réel: start_time/end_time/visibility/is_published)
+    try:
+        pub = {k: sub.get(k) for k in [
+            "title","title_mina","description","description_mina",
+            "city","venue_name","address","lat","lon",
+            "start_time","end_time","price","visibility",
+            "contact_phone","contact_url","cover_url"
+        ]}
+        pub["is_published"] = True
+        ins = supabase.table("events").insert(pub).execute()
+        new_id = ins.data[0]["id"]
+    except Exception as e:
+        if debug:
+            return {"ok": False, "error": f"insert events fail: {e!r}"}
+        raise HTTPException(status_code=500, detail="insert events fail")
+
+    # marquer la submission comme acceptée
+    try:
+        supabase.table("event_submissions").update({"accepted": True, "admin_note": inp.admin_note or "published"}).eq("id", inp.submission_id).execute()
+    except Exception as e:
+        if debug:
+            return {"ok": True, "published": True, "event_id": new_id, "warn": f"update submission note fail: {e!r}"}
+        # on ne bloque pas si l'insert events a réussi
+
+    return {"ok": True, "published": True, "event_id": new_id}
+
 
 # ------------------------- Audio embedding proxy -------------------------
 @app.post("/api/compute_audio_embedding")
