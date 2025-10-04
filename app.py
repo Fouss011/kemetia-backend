@@ -787,6 +787,67 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     return {"ok": True, "published": True, "event_id": new_id}
 
 
+# ---------- Event short announce (TTS ~30s) ----------
+from functools import lru_cache
+
+def _announce_text(ev: dict) -> str:
+    title = (ev.get("title") or "").strip()
+    when  = (ev.get("starts_at") or ev.get("start_time") or "").strip()
+    where = " · ".join([x for x in [(ev.get("venue_name") or "").strip(),
+                                    (ev.get("location_text") or "").strip(),
+                                    (ev.get("city") or "").strip()] if x])
+    price = (ev.get("price_text") or ev.get("price_display") or "").strip()
+    parts = [f"Événement : {title}."]
+    if when:  parts.append(f"Date et heure : {when}.")
+    if where: parts.append(f"Lieu : {where}.")
+    if price: parts.append(f"Tarif : {price}.")
+    parts.append("Ne manquez pas !")
+    return " ".join(parts)
+
+@lru_cache(maxsize=256)
+def _tts_b64_for_event(event_id: int) -> str:
+    # retourne base64 MP3 ou lève Exception
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY manquant")
+    # récupérer l’event
+    r = supabase.table("events").select("*").eq("id", event_id).limit(1).execute()
+    ev = (r.data or [None])[0]
+    if not ev:
+        raise RuntimeError("event not found")
+    txt = _announce_text(ev)
+    # TTS OpenAI (MP3)
+    try:
+        # SDK v1
+        speech = openai_client.audio.speech.create(
+            model="gpt-4o-mini-tts",  # sinon "tts-1"
+            voice="alloy",
+            input=txt,
+            format="mp3"
+        )
+        mp3_bytes = speech.content  # bytes
+    except Exception:
+        # fallback API older style (selon version SDK)
+        with openai_client.audio.speech.with_streaming_response.create(
+            model="gpt-4o-mini-tts", voice="alloy", input=txt
+        ) as resp:
+            mp3_bytes = resp.read()
+    import base64
+    return base64.b64encode(mp3_bytes).decode("ascii")
+
+@app.get("/api/event_announce_preview")
+def api_event_announce_preview(event_id: int):
+    """
+    Renvoie un MP3 dataURL (30s max) pour annoncer l’événement.
+    """
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    try:
+        b64 = _tts_b64_for_event(int(event_id))
+        return {"audio": f"data:audio/mpeg;base64,{b64}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS error: {e}")
+
+
 
 # ------------------------- Audio embedding proxy -------------------------
 @app.post("/api/compute_audio_embedding")
