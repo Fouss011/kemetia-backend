@@ -494,59 +494,69 @@ def api_nearby(inp: NearbyIn):
     return {"items": items[:25]} if items else {"items": [], "notice": "Aucun résultat dans ce rayon."}
 
 # ------------------------- Événements publics (API unifiée) -------------------------
-def _fmt_price(amount, currency):
+def _fmt_price(amount, currency, text_fallback=None):
+    """
+    Affiche un prix soit au format numérique + devise, soit (fallback) le texte libre venant de la DB.
+    """
     try:
-        if amount is None:
-            return None
-        a = float(amount)
-        cur = (currency or "").upper() or "XOF"
-        return f"{int(a)} {cur}" if a.is_integer() else f"{a:.0f} {cur}"
+        if amount is not None:
+            a = float(amount)
+            cur = (currency or "XOF").upper()
+            return f"{int(a)} {cur}" if a.is_integer() else f"{a:.0f} {cur}"
     except Exception:
-        return None
+        pass
+    return (text_fallback or None)
+
 
 @app.post("/api/events_public")
 def api_events_public(q: EventsQuery):
     """
-    Renvoie deux listes :
-      - local   : événements à venir dans le rayon (si lat/lon fournis)
-      - national: événements marqués 'is_national = true' à venir (partout)
+    Renvoie:
+      - local    : événements à venir dans le rayon (si lat/lon fournis)
+      - national : événements marqués 'is_national = true' à venir (partout)
     Champs renvoyés: id,title,description,location_text,lat,lon,starts_at,price_display,is_national,audio_url
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
     now = datetime.now(timezone.utc)
-    max_dt = now + timedelta(hours=max(1, min(q.horizon_hours, 24*14)))  # max 14j
+    horizon = max(1, min(q.horizon_hours or 168, 24*14))
+    max_dt = now + timedelta(hours=horizon)
 
-    # 1) Nationaux
+    FIELDS = ",".join([
+        "id","title","description","location_text","lat","lon",
+        "starts_at","is_national",
+        "price_amount","price_currency","price_text",
+        "audio_url"
+    ])
+
+    # ---------- Nationaux ----------
     nat = (
-        supabase.table("events")
-        .select("id,title,description,location_text,lat,lon,starts_at,is_national,price_amount,price_currency,audio_url")
+        supabase.table("events_api")
+        .select(FIELDS)
         .eq("is_national", True)
         .gte("starts_at", now.isoformat())
         .lte("starts_at", max_dt.isoformat())
         .order("starts_at", desc=False)
-        .limit(50)
+        .limit(200)
         .execute()
     ).data or []
-    for r in nat:
-        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"))
-        try:
-            if isinstance(r.get("starts_at"), datetime):
-                r["starts_at"] = r["starts_at"].isoformat()
-        except:
-            pass
 
-    # 2) Locaux si géoloc fournie
+    for r in nat:
+        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
+        if isinstance(r.get("starts_at"), datetime):
+            r["starts_at"] = r["starts_at"].isoformat()
+
+    # ---------- Locaux (si géoloc) ----------
     loc = []
     if q.lat is not None and q.lon is not None:
         base = (
-            supabase.table("events")
-            .select("id,title,description,location_text,lat,lon,starts_at,is_national,price_amount,price_currency,audio_url")
+            supabase.table("events_api")
+            .select(FIELDS)
             .gte("starts_at", now.isoformat())
             .lte("starts_at", max_dt.isoformat())
             .order("starts_at", desc=False)
-            .limit(200)
+            .limit(1000)
             .execute()
         ).data or []
 
@@ -558,12 +568,9 @@ def api_events_public(q: EventsQuery):
             d = _haversine(float(q.lat), float(q.lon), lt, ln)
             if d <= float(q.radius_m or 5000):
                 r["distance_m"] = int(d)
-                r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"))
-                try:
-                    if isinstance(r.get("starts_at"), datetime):
-                        r["starts_at"] = r["starts_at"].isoformat()
-                except:
-                    pass
+                r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
+                if isinstance(r.get("starts_at"), datetime):
+                    r["starts_at"] = r["starts_at"].isoformat()
                 loc.append(r)
 
         loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
@@ -574,14 +581,20 @@ def api_events_public(q: EventsQuery):
         "now": now.isoformat()
     }
 
+
 @app.get("/api/events/{event_id}")
 def api_event_detail(event_id: int):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-    r = supabase.table("events").select("*").eq("id", event_id).limit(1).execute()
+    r = supabase.table("events_api").select("*").eq("id", event_id).limit(1).execute()
     it = (r.data or [None])[0]
     if not it: raise HTTPException(status_code=404, detail="Event not found")
+    # Normalise le prix pour l’affichage si besoin
+    it["price_display"] = _fmt_price(it.get("price_amount"), it.get("price_currency"), it.get("price_text"))
+    if isinstance(it.get("starts_at"), datetime):
+        it["starts_at"] = it["starts_at"].isoformat()
     return it
+
 
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn):
