@@ -759,95 +759,69 @@ def api_events_admin_pending(request: Request, limit: int = 200):
 # ---- ADMIN: publier/refuser une proposition (debug-friendly) ----
 @app.post("/api/events_admin/publish")
 def api_events_admin_publish(inp: EventPublishIn, request: Request):
-    """
-    Publie (ou refuse) une soumission d'évènement.
-
-    - Auth: header Authorization: Bearer <ADMIN_TOKEN>
-    - Si accept=False : marque la soumission comme refusée.
-    - Si accept=True  : insère dans 'events' en mappant proprement les champs.
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # --- Auth admin (Bearer)
+    # Auth admin
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # --- Lire la soumission
-    try:
-        r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
-        sub = (r.data or [None])[0]
-    except Exception as e:
-        return {"ok": False, "error": f"read submissions fail: {e!r}"}
-
+    # Récupérer la soumission
+    r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
+    sub = (r.data or [None])[0]
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    # --- Refus : on marque et on sort
+    # Refus
     if not inp.accept:
-        try:
-            supabase.table("event_submissions").update({
-                "accepted": False,
-                "admin_note": inp.admin_note or "refused",
-                "is_reviewed": True,
-                "is_approved": False
-            }).eq("id", inp.submission_id).execute()
-        except Exception as e:
-            return {"ok": False, "error": f"update submission fail: {e!r}"}
+        supabase.table("event_submissions").update({
+            "accepted": False,
+            "admin_note": inp.admin_note or "refused",
+            "is_reviewed": True,
+            "is_approved": False
+        }).eq("id", inp.submission_id).execute()
         return {"ok": True, "published": False}
 
-    # --- Mapping propre vers la table 'events'
-    # location_text priorise salle/adresse/ville
-    loc_text = (sub.get("venue_name") or sub.get("address") or sub.get("city") or None)
-
-    # visibility fallback + validation
+    # Fallback visibility
     vis = (sub.get("visibility") or "local").lower()
-    if vis not in ("local", "city", "national", "global"):
+    if vis not in ("local","city","national","global"):
         vis = "local"
 
-    # national si visibilité est nationale/globale
-    is_nat = vis in ("national", "global")
-
-    # dates : table 'events' utilise starts_at / ends_at (pas start_time / end_time)
-    starts_at = sub.get("start_time") or None
-    ends_at   = sub.get("end_time") or None
-
-    # prix : ta table a 'price_text' (+ price_amount/currency optionnels)
-    price_text = sub.get("price") or None
-    price_amount = None
-    price_currency = "XOF"  # défaut raisonnable
-
+    # Construire la ligne pour 'events' en respectant SES colonnes (start_time/end_time)
     pub = {
         "title":            sub.get("title"),
         "title_mina":       sub.get("title_mina"),
         "description":      sub.get("description"),
         "description_mina": sub.get("description_mina"),
-        "location_text":    loc_text,
         "city":             sub.get("city"),
         "venue_name":       sub.get("venue_name"),
         "address":          sub.get("address"),
         "lat":              sub.get("lat"),
         "lon":              sub.get("lon"),
 
-        # ⬇️ colonnes de ta table 'events'
-        "starts_at":        starts_at,
-        "ends_at":          ends_at,
+        # ⬇️ ta table utilise ces noms-ci :
+        "start_time":       sub.get("start_time") or None,
+        "end_time":         sub.get("end_time")   or None,
+
+        "price":            sub.get("price"),             # ta table a 'price' (texte)
         "visibility":       vis,
-        "is_national":      is_nat,
-
-        "price_text":       price_text,
-        "price_amount":     price_amount,
-        "price_currency":   price_currency,
-
         "audio_url":        sub.get("audio_url"),
 
-        # drapeau publication (utilisé par /api/events_public)
         "is_published":     True,
+        # Coherence si tu as ce bool dans events
+        "is_national":      True if vis in ("national","global") else False,
+        # Si ta table a 'location_text'
+        "location_text":    (sub.get("venue_name") or sub.get("address") or sub.get("city") or None),
+        # Si ta table a 'price_currency' (défaut)
+        "price_currency":   "XOF",
     }
 
-    # --- Insert dans events
+    # Enlever les clés None si la colonne n’existe pas chez toi ne gêne pas PostgREST,
+    # mais pour éviter tout conflit de cache, on peut nettoyer:
+    pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
+
     try:
         ins = supabase.table("events").insert(pub).execute()
         if not ins.data:
@@ -856,7 +830,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     except Exception as e:
         return {"ok": False, "error": f"insert events fail: {e}"}
 
-    # --- Marquer la soumission comme acceptée
+    # Marquer la soumission comme acceptée
     try:
         supabase.table("event_submissions").update({
             "accepted": True,
@@ -865,11 +839,9 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
             "is_approved": True
         }).eq("id", inp.submission_id).execute()
     except Exception as e:
-        # on renvoie quand même l'id créé, mais on expose l'erreur de mise à jour
         return {"ok": True, "published": True, "event_id": new_id, "warn": f"submission update fail: {e!r}"}
 
     return {"ok": True, "published": True, "event_id": new_id}
-
 
 
 # ---------- Event short announce (TTS ~30s) ----------
