@@ -603,6 +603,18 @@ def api_events_probe(limit: int = 5):
         return {"items": [], "error": f"{e!r}"}
 
 
+@app.get("/diag/versions")
+def diag_versions():
+    import pkg_resources
+    def v(p): 
+        try: return pkg_resources.get_distribution(p).version
+        except: return None
+    return {
+        "supabase": v("supabase"),
+        "postgrest": v("postgrest"),
+        "httpx": v("httpx")
+    }
+
 
 
 @app.get("/api/events/{event_id}")
