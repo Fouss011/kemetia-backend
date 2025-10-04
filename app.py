@@ -633,10 +633,6 @@ def api_event_detail(event_id: int):
 
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn, request: Request):
-    """
-    Crée une proposition dans event_submissions.
-    Ajoute ?debug=1 à l'URL pour renvoyer l'erreur détaillée au lieu d'un 500.
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
@@ -647,25 +643,23 @@ def api_event_submit(inp: EventSubmitIn, request: Request):
         vis = "local"
 
     row = {
-        "title":        (inp.title or "").strip(),
-        "title_mina":    inp.title_mina,
-        "description":   inp.description,
+        "title": (inp.title or "").strip(),
+        "title_mina": inp.title_mina,
+        "description": inp.description,
         "description_mina": inp.description_mina,
-        "city":          inp.city,
-        "venue_name":    inp.venue_name,
-        "address":       inp.address,
-        "lat":           inp.lat,
-        "lon":           inp.lon,
-        # ton schéma réel utilise start_time / end_time (timestamptz)
-        "start_time":    inp.start_time,
-        "end_time":      inp.end_time,
-        # prix libre (texte) dans ta table
-        "price":         inp.price,
-        "visibility":    vis,
+        "city": inp.city,
+        "venue_name": inp.venue_name,
+        "address": inp.address,
+        "lat": inp.lat,
+        "lon": inp.lon,
+        "start_time": inp.start_time,
+        "end_time": inp.end_time,
+        "price": inp.price,
+        "visibility": vis,
         "contact_phone": inp.contact_phone,
-        "contact_url":   inp.contact_url,
-        "cover_url":     inp.cover_url,
-        "accepted":      None
+        "contact_url": inp.contact_url,
+        "cover_url": inp.cover_url
+        # NE PAS mettre "accepted" ici → null par défaut
     }
 
     if not row["title"] or not row["start_time"]:
@@ -680,10 +674,9 @@ def api_event_submit(inp: EventSubmitIn, request: Request):
             raise HTTPException(status_code=500, detail="Insert proposition échoué")
         return {"ok": True, "submission_id": res.data[0]["id"]}
     except Exception as e:
-        # en debug, on renvoie l’exception brute pour diagnostiquer
-        if debug:
-            return {"ok": False, "error": f"{e!r}", "row": row}
+        if debug: return {"ok": False, "error": f"{e!r}", "row": row}
         raise HTTPException(status_code=500, detail="Insert proposition échoué")
+
 
 @app.get("/api/submissions_probe")
 def submissions_probe(limit: int = 5):
@@ -722,26 +715,25 @@ def api_events_admin_pending(request: Request, limit: int = 200):
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     debug = (request.query_params.get("debug") == "1")
 
-    # Auth
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        res = (
-            supabase.table("event_submissions")
-            .select("id,title,description,city,venue_name,address,lat,lon,start_time,end_time,price,visibility,contact_phone,contact_url,cover_url,accepted,admin_note,created_at")
-            .is_("accepted", None)
-            .order("created_at", desc=True)
-            .limit(max(1, min(limit, 500)))
-            .execute()
-        )
+        q = (supabase.table("event_submissions")
+             .select("*")
+             .order("created_at", desc=True)
+             .limit(max(1, min(limit, 500))))
+        # filtre accepted IS NULL si la colonne existe
+        # (elle existe après le SQL ci-dessus)
+        q = q.is_("accepted", None)
+        res = q.execute()
         return {"items": res.data or []}
     except Exception as e:
-        if debug:
-            return {"items": [], "error": f"{e!r}"}
+        if debug: return {"items": [], "error": f"{e!r}"}
         raise HTTPException(status_code=500, detail="DB error")
+
 
 # ---- ADMIN: publier/refuser une proposition (debug-friendly) ----
 @app.post("/api/events_admin/publish")
@@ -750,35 +742,29 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         raise HTTPException(status_code=500, detail="Supabase non configuré")
     debug = (request.query_params.get("debug") == "1")
 
-    # Auth
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # lecture submission
     try:
         r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
         sub = (r.data or [None])[0]
     except Exception as e:
-        if debug:
-            return {"ok": False, "error": f"read submissions fail: {e!r}"}
+        if debug: return {"ok": False, "error": f"read submissions fail: {e!r}"}
         raise HTTPException(status_code=500, detail="read submissions fail")
 
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    # refus ?
     if not inp.accept:
         try:
             supabase.table("event_submissions").update({"accepted": False, "admin_note": inp.admin_note or "refused"}).eq("id", inp.submission_id).execute()
             return {"ok": True, "published": False}
         except Exception as e:
-            if debug:
-                return {"ok": False, "error": f"update refuse fail: {e!r}"}
+            if debug: return {"ok": False, "error": f"update refuse fail: {e!r}"}
             raise HTTPException(status_code=500, detail="update refuse fail")
 
-    # publication -> insérer dans events (ton schéma réel: start_time/end_time/visibility/is_published)
     try:
         pub = {k: sub.get(k) for k in [
             "title","title_mina","description","description_mina",
@@ -790,19 +776,16 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         ins = supabase.table("events").insert(pub).execute()
         new_id = ins.data[0]["id"]
     except Exception as e:
-        if debug:
-            return {"ok": False, "error": f"insert events fail: {e!r}"}
+        if debug: return {"ok": False, "error": f"insert events fail: {e!r}"}
         raise HTTPException(status_code=500, detail="insert events fail")
 
-    # marquer la submission comme acceptée
     try:
         supabase.table("event_submissions").update({"accepted": True, "admin_note": inp.admin_note or "published"}).eq("id", inp.submission_id).execute()
     except Exception as e:
-        if debug:
-            return {"ok": True, "published": True, "event_id": new_id, "warn": f"update submission note fail: {e!r}"}
-        # on ne bloque pas si l'insert events a réussi
+        if debug: return {"ok": True, "published": True, "event_id": new_id, "warn": f"update submission note fail: {e!r}"}
 
     return {"ok": True, "published": True, "event_id": new_id}
+
 
 
 # ------------------------- Audio embedding proxy -------------------------
