@@ -586,6 +586,23 @@ def api_events_public(q: EventsQuery, request: Request):
         raise HTTPException(status_code=500, detail="postproc fail")
 
 
+@app.get("/api/events_probe")
+def api_events_probe(limit: int = 5):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    try:
+        rows = (
+            supabase.table("events_api")
+            .select("*")
+            .order("starts_at", desc=False)
+            .limit(max(1, min(limit, 50)))
+            .execute()
+        ).data or []
+        return {"items": rows, "count": len(rows)}
+    except Exception as e:
+        return {"items": [], "error": f"{e!r}"}
+
+
 
 
 @app.get("/api/events/{event_id}")
