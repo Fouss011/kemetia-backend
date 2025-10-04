@@ -509,16 +509,17 @@ def _fmt_price(amount, currency, text_fallback=None):
 
 
 @app.post("/api/events_public")
-def api_events_public(q: EventsQuery):
+def api_events_public(q: EventsQuery, request: Request):
     """
-    Renvoie:
-      - local    : événements à venir dans le rayon (si lat/lon fournis)
-      - national : événements marqués 'is_national = true' à venir (partout)
-    On lit la vue 'events_api' puis on filtre en Python (pas de gte/lte côté SQL),
-    ce qui évite les erreurs de cast sur starts_at (text vs timestamptz).
+    Lit la vue 'events_api' puis filtre en Python (dates + géo).
+    Si debug=1 (query string), renvoie l'erreur en clair au lieu d'un 500.
     """
+    debug = (request.query_params.get("debug") == "1")
+
     if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase non configuré")
+        msg = "Supabase non configuré"
+        if debug: return {"local": [], "national": [], "now": datetime.now(timezone.utc).isoformat(), "error": msg}
+        raise HTTPException(status_code=500, detail=msg)
 
     now = datetime.now(timezone.utc)
     horizon = max(1, min(q.horizon_hours or 168, 24*14))
@@ -526,74 +527,64 @@ def api_events_public(q: EventsQuery):
 
     FIELDS = ",".join([
         "id","title","description","location_text","lat","lon",
-        "starts_at","is_national",
-        "price_amount","price_currency","price_text",
-        "audio_url"
+        "starts_at","is_national","price_amount","price_currency","price_text","audio_url"
     ])
 
-    # 1) Récup brute (PAS de gte/lte), on limite à 1000 max
+    def parse_iso(s):
+        if not s: return None
+        try: return datetime.fromisoformat(str(s).replace("Z","+00:00"))
+        except: return None
+
     try:
+        # 1) lecture brute de la vue (pas de gte/lte)
         raw = (
             supabase.table("events_api")
             .select(FIELDS)
-            .order("starts_at", desc=False)   # tri ok même si text; on re-filtrera après
+            .order("starts_at", desc=False)   # tri soft (même si text)
             .limit(1000)
             .execute()
         ).data or []
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+        if debug: return {"local": [], "national": [], "now": now.isoformat(), "error": f"DB read fail: {e!r}"}
+        raise HTTPException(status_code=500, detail="DB read fail")
 
-    def parse_iso(s):
-        if not s: return None
-        try:
-            # tolère "Z"
-            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
-        except:
-            return None
-
-    # 2) Normalisation + fenêtre de temps
-    normalized = []
-    for r in raw:
-        st = r.get("starts_at")
-        dt = parse_iso(st)
-        if not dt:    # pas de date → on ignore
-            continue
-        if not (now <= dt <= max_dt):   # hors fenêtre → on ignore
-            continue
-
-        # prix
-        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
-        # ISO stringify si besoin
-        if isinstance(st, datetime):
-            r["starts_at"] = st.isoformat()
-        normalized.append(r)
-
-    # 3) Split national / local
-    nat = [r for r in normalized if bool(r.get("is_national"))]
-    loc = []
-    if q.lat is not None and q.lon is not None:
-        for r in normalized:
-            if r.get("lat") is None or r.get("lon") is None:
+    try:
+        # 2) normalisation + fenêtre de temps
+        normalized = []
+        for r in raw:
+            dt = parse_iso(r.get("starts_at"))
+            if not dt or not (now <= dt <= max_dt):   # hors fenêtre
                 continue
-            try:
-                d = _haversine(float(q.lat), float(q.lon), float(r["lat"]), float(r["lon"]))
-            except:
-                continue
-            if d <= float(q.radius_m or 5000):
-                r2 = dict(r)
-                r2["distance_m"] = int(d)
-                loc.append(r2)
+            # prix joli
+            r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
+            # ensure iso string
+            if isinstance(r.get("starts_at"), datetime):
+                r["starts_at"] = r["starts_at"].isoformat()
+            normalized.append(r)
 
-        loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
+        # 3) split national / local
+        nat = [r for r in normalized if bool(r.get("is_national"))]
+        nat.sort(key=lambda r: (r.get("starts_at") or ""))
 
-    # 4) Tri national par date
-    nat.sort(key=lambda r: (r.get("starts_at") or ""))
+        loc = []
+        if q.lat is not None and q.lon is not None:
+            blat, blon = float(q.lat), float(q.lon)
+            rad = float(q.radius_m or 5000)
+            for r in normalized:
+                try:
+                    d = _haversine(blat, blon, float(r["lat"]), float(r["lon"]))
+                except Exception:
+                    continue
+                if d <= rad:
+                    r2 = dict(r); r2["distance_m"] = int(d); loc.append(r2)
+            loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
 
-    return {
-        "local": loc[:100],
-        "national": nat[:100],
-        "now": now.isoformat()
-    }
+        return {"local": loc[:100], "national": nat[:100], "now": now.isoformat()}
+    except Exception as e:
+        if debug:
+            return {"local": [], "national": [], "now": now.isoformat(), "error": f"postproc fail: {e!r}", "raw_count": len(raw)}
+        raise HTTPException(status_code=500, detail="postproc fail")
+
 
 
 
