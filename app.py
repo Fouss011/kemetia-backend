@@ -632,26 +632,88 @@ def api_event_detail(event_id: int):
 
 
 @app.post("/api/event_submit")
-def api_event_submit(inp: EventSubmitIn):
+def api_event_submit(inp: EventSubmitIn, request: Request):
+    """
+    Crée une proposition dans event_submissions.
+    Ajoute ?debug=1 à l'URL pour renvoyer l'erreur détaillée au lieu d'un 500.
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    debug = (request.query_params.get("debug") == "1")
+
     vis = (inp.visibility or "local").lower()
-    if vis not in ("local","city","national","global"): vis = "local"
+    if vis not in ("local","city","national","global"):
+        vis = "local"
+
     row = {
-        "title": (inp.title or "").strip(),
-        "title_mina": inp.title_mina, "description": inp.description, "description_mina": inp.description_mina,
-        "city": inp.city, "venue_name": inp.venue_name, "address": inp.address,
-        "lat": inp.lat, "lon": inp.lon,
-        "start_time": inp.start_time, "end_time": inp.end_time,
-        "price": inp.price, "visibility": vis,
-        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url, "cover_url": inp.cover_url,
-        "accepted": None
+        "title":        (inp.title or "").strip(),
+        "title_mina":    inp.title_mina,
+        "description":   inp.description,
+        "description_mina": inp.description_mina,
+        "city":          inp.city,
+        "venue_name":    inp.venue_name,
+        "address":       inp.address,
+        "lat":           inp.lat,
+        "lon":           inp.lon,
+        # ton schéma réel utilise start_time / end_time (timestamptz)
+        "start_time":    inp.start_time,
+        "end_time":      inp.end_time,
+        # prix libre (texte) dans ta table
+        "price":         inp.price,
+        "visibility":    vis,
+        "contact_phone": inp.contact_phone,
+        "contact_url":   inp.contact_url,
+        "cover_url":     inp.cover_url,
+        "accepted":      None
     }
+
     if not row["title"] or not row["start_time"]:
-        raise HTTPException(status_code=400, detail="title et start_time requis")
-    res = supabase.table("event_submissions").insert(row).execute()
-    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
-    return {"ok": True, "submission_id": res.data[0]["id"]}
+        msg = "title et start_time requis"
+        if debug: return {"ok": False, "error": msg, "row": row}
+        raise HTTPException(status_code=400, detail=msg)
+
+    try:
+        res = supabase.table("event_submissions").insert(row).execute()
+        if not res.data:
+            if debug: return {"ok": False, "error": "insert vide", "row": row}
+            raise HTTPException(status_code=500, detail="Insert proposition échoué")
+        return {"ok": True, "submission_id": res.data[0]["id"]}
+    except Exception as e:
+        # en debug, on renvoie l’exception brute pour diagnostiquer
+        if debug:
+            return {"ok": False, "error": f"{e!r}", "row": row}
+        raise HTTPException(status_code=500, detail="Insert proposition échoué")
+
+@app.get("/api/submissions_probe")
+def submissions_probe(limit: int = 5):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    try:
+        rows = (supabase.table("event_submissions")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(max(1, min(limit, 50)))
+                .execute()).data or []
+        return {"items": rows, "count": len(rows)}
+    except Exception as e:
+        return {"items": [], "error": f"{e!r}"}
+
+@app.get("/api/submissions_columns")
+def submissions_columns():
+    # Liste les colonnes vues par PostgREST (utile si erreur de schéma)
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    try:
+        # PostgREST n’a pas d’endpoint “describe”, on tente une ligne vide
+        rows = (supabase.table("event_submissions")
+                .select("*")
+                .limit(1)
+                .execute()).data or []
+        cols = list(rows[0].keys()) if rows else None
+        return {"columns": cols, "hint": "Si 'columns' est null, insère une ligne test pour révéler les noms."}
+    except Exception as e:
+        return {"columns": None, "error": f"{e!r}"}
 
 # ---- ADMIN: lister les propositions en attente (debug-friendly) ----
 @app.get("/api/events_admin/pending")
