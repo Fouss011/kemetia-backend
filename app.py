@@ -514,7 +514,8 @@ def api_events_public(q: EventsQuery):
     Renvoie:
       - local    : événements à venir dans le rayon (si lat/lon fournis)
       - national : événements marqués 'is_national = true' à venir (partout)
-    Champs renvoyés: id,title,description,location_text,lat,lon,starts_at,price_display,is_national,audio_url
+    On lit la vue 'events_api' puis on filtre en Python (pas de gte/lte côté SQL),
+    ce qui évite les erreurs de cast sur starts_at (text vs timestamptz).
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
@@ -530,56 +531,70 @@ def api_events_public(q: EventsQuery):
         "audio_url"
     ])
 
-    # ---------- Nationaux ----------
-    nat = (
-        supabase.table("events_api")
-        .select(FIELDS)
-        .eq("is_national", True)
-        .gte("starts_at", now.isoformat())
-        .lte("starts_at", max_dt.isoformat())
-        .order("starts_at", desc=False)
-        .limit(200)
-        .execute()
-    ).data or []
-
-    for r in nat:
-        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
-        if isinstance(r.get("starts_at"), datetime):
-            r["starts_at"] = r["starts_at"].isoformat()
-
-    # ---------- Locaux (si géoloc) ----------
-    loc = []
-    if q.lat is not None and q.lon is not None:
-        base = (
+    # 1) Récup brute (PAS de gte/lte), on limite à 1000 max
+    try:
+        raw = (
             supabase.table("events_api")
             .select(FIELDS)
-            .gte("starts_at", now.isoformat())
-            .lte("starts_at", max_dt.isoformat())
-            .order("starts_at", desc=False)
+            .order("starts_at", desc=False)   # tri ok même si text; on re-filtrera après
             .limit(1000)
             .execute()
         ).data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-        for r in base:
-            try:
-                lt, ln = float(r["lat"]), float(r["lon"])
-            except Exception:
+    def parse_iso(s):
+        if not s: return None
+        try:
+            # tolère "Z"
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except:
+            return None
+
+    # 2) Normalisation + fenêtre de temps
+    normalized = []
+    for r in raw:
+        st = r.get("starts_at")
+        dt = parse_iso(st)
+        if not dt:    # pas de date → on ignore
+            continue
+        if not (now <= dt <= max_dt):   # hors fenêtre → on ignore
+            continue
+
+        # prix
+        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
+        # ISO stringify si besoin
+        if isinstance(st, datetime):
+            r["starts_at"] = st.isoformat()
+        normalized.append(r)
+
+    # 3) Split national / local
+    nat = [r for r in normalized if bool(r.get("is_national"))]
+    loc = []
+    if q.lat is not None and q.lon is not None:
+        for r in normalized:
+            if r.get("lat") is None or r.get("lon") is None:
                 continue
-            d = _haversine(float(q.lat), float(q.lon), lt, ln)
+            try:
+                d = _haversine(float(q.lat), float(q.lon), float(r["lat"]), float(r["lon"]))
+            except:
+                continue
             if d <= float(q.radius_m or 5000):
-                r["distance_m"] = int(d)
-                r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
-                if isinstance(r.get("starts_at"), datetime):
-                    r["starts_at"] = r["starts_at"].isoformat()
-                loc.append(r)
+                r2 = dict(r)
+                r2["distance_m"] = int(d)
+                loc.append(r2)
 
         loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
+
+    # 4) Tri national par date
+    nat.sort(key=lambda r: (r.get("starts_at") or ""))
 
     return {
         "local": loc[:100],
         "national": nat[:100],
         "now": now.isoformat()
     }
+
 
 
 @app.get("/api/events/{event_id}")
