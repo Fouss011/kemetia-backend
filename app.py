@@ -317,6 +317,7 @@ def _match_intent_mina(text: str):
     return None, None
 
 # ------------------------- Debug audio-match -------------------------
+# ------------------------- Debug audio-match -------------------------
 @app.post("/api/debug_audio_match")
 def api_debug_audio_match(inp: DebugAudioIn):
     if supabase is None:
@@ -324,14 +325,16 @@ def api_debug_audio_match(inp: DebugAudioIn):
     if not (isinstance(inp.audio, str) and inp.audio.startswith("data:")):
         raise HTTPException(status_code=400, detail="audio dataURL requis")
     avec = _embedding_via_worker(inp.audio)
-    if not avec: raise HTTPException(status_code=500, detail="embedding vide (worker)")
+    if not avec:
+        raise HTTPException(status_code=500, detail="embedding vide (worker)")
     rpc = supabase.rpc("match_audio_by_vector", {
         "p_lang": inp.lang.lower(),
         "p_query": avec,
         "p_limit": max(1, min(inp.limit, 20))
     }).execute()
     rows = rpc.data or []
-    for r in rows: r["sim"] = 1.0 - float(r.get("distance", 1.0))
+    for r in rows:
+        r["sim"] = 1.0 - float(r.get("distance", 1.0))
     return {"candidates": rows[:inp.limit]}
 
 # ------------------------- Chat (règles Mina simplifiées) -------------------------
@@ -340,47 +343,34 @@ def api_chat(inp: ChatIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # 0) INTRO FORCÉE si aucun texte (appel initial du front)
     user_text = (inp.text or "").strip()
-    if user_text == "" and not inp.from_audio:
-        return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
-    
-    @app.post("/api/chat")
-def api_chat(inp: ChatIn):
-    if supabase is None:
-        raise HTTPException(status_code=500, detail="Supabase non configuré")
+    is_audio = bool(inp.from_audio or inp.audio)
 
-    user_text = (inp.text or "").strip()
-
-    # ===== ➊ PIPELINE AUDIO (si from_audio ou audio fourni) =====
-    if (inp.from_audio or inp.audio) and isinstance(inp.audio, str) and inp.audio.startswith("data:"):
+    # 1) PIPELINE AUDIO
+    if is_audio and isinstance(inp.audio, str) and inp.audio.startswith("data:"):
+        # 1a) Matching audio
         try:
-            # 1) embedding audio via worker
             avec = _embedding_via_worker(inp.audio)
-            if not avec:
-                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:no-vec"}
+        except Exception as e:
+            print("audio-worker err:", e)
+            avec = []
 
-            # 2) top-k match en DB (pgvector)
-            rpc = supabase.rpc("match_audio_by_vector", {
-                "p_lang": (inp.sourceLang or "mina").lower(),
-                "p_query": avec,
-                "p_limit": 5
-            }).execute()
-            rows = rpc.data or []
-            # convertir distance -> similarité
-            for r in rows:
-                r["sim"] = 1.0 - float(r.get("distance", 1.0))
+        best = None
+        if avec:
+            try:
+                rpc = supabase.rpc("match_audio_by_vector", {
+                    "p_lang": (inp.sourceLang or "mina").lower(),
+                    "p_query": avec,
+                    "p_limit": 5
+                }).execute()
+                rows = rpc.data or []
+                for r in rows:
+                    r["sim"] = 1.0 - float(r.get("distance", 1.0))
+                best = max(rows, key=lambda r: r.get("sim", 0.0), default=None)
+            except Exception as e:
+                print("RPC match_audio_by_vector err:", e)
 
-            best = max(rows, key=lambda r: r.get("sim", 0.0), default=None)
-            if not best:
-                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:empty"}
-
-            if best["sim"] < AUDIO_SIM_THRESHOLD:
-                # si seuil non atteint → message “dis ce que tu veux”
-                return {"reply": FALLBACK_MINA, "row_id": best.get("id"), "mode": f"audio:low({best['sim']:.2f})"}
-
-            # 3) construire la réponse
-            # priorité: reply_same (même langue) > fr > en > text de la base
+        if best and best.get("sim", 0.0) >= AUDIO_SIM_THRESHOLD:
             reply = (
                 (best.get("reply_same") or "").strip()
                 or (best.get("fr") or "").strip()
@@ -388,27 +378,63 @@ def api_chat(inp: ChatIn):
                 or (best.get("text") or "").strip()
                 or FALLBACK_MINA
             )
-            return {
-                "reply": reply,
-                "row_id": best.get("id"),
-                "mode": f"audio:match({best['sim']:.2f})",
-                "meta": {"sim": best.get("sim")}
-            }
-        except Exception as e:
-            print("audio-match err:", e)
-            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:error"}
+            return {"reply": reply, "row_id": best.get("id"), "mode": f"audio:match({best['sim']:.2f})"}
 
-    # ===== ➋ INTRO FORCÉE si aucun texte (appel initial du front)
-    if user_text == "" and not inp.from_audio:
+        # 1b) HARD_AUDIO_ONLY => pas de STT
+        if HARD_AUDIO_ONLY:
+            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:hard-fallback"}
+
+        # 1c) STT fallback
+        if openai_client:
+            try:
+                header, b64 = inp.audio.split(",", 1)
+                raw = base64.b64decode(b64)
+                mime = "application/octet-stream"
+                try:
+                    mime = header.split(";")[0].split(":", 1)[1] or mime
+                except Exception:
+                    pass
+                ext = ".bin"
+                if   "webm" in mime: ext = ".webm"
+                elif "ogg"  in mime: ext = ".ogg"
+                elif "mp4" in mime or "m4a" in mime: ext = ".m4a"
+                elif "wav"  in mime: ext = ".wav"
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+                    f.write(raw)
+                    tmp_path = f.name
+                try:
+                    with open(tmp_path, "rb") as fh:
+                        tr = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
+                    stt_text = (getattr(tr, "text", "") or "").strip()
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except:
+                        pass
+
+                if stt_text:
+                    user_text = stt_text
+                else:
+                    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-empty"}
+            except Exception as e:
+                print("STT fallback err:", repr(e))
+                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-error"}
+        else:
+            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:no-openai"}
+
+    # 2) INTRO si pas de texte
+    if user_text == "" and not is_audio:
         return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
 
-    # ===== ➌ INTENTS MINA (texte)
+    # 3) RÈGLES (texte)
     intent, rule_reply = _match_intent_mina(user_text)
     if intent and rule_reply:
         return {"reply": rule_reply, "row_id": None, "mode": f"rule:{intent}"}
 
-    # ===== ➍ FALLBACK (texte incompris)
+    # 4) FALLBACK
     return {"reply": FALLBACK_MINA, "row_id": None, "mode": "fallback"}
+
 
 
 # ------------------------- Collect -------------------------
@@ -858,40 +884,8 @@ def api_event_detail(event_id: int):
     return it
 
 # ------------------------- Submit Event -------------------------
-# ===================== Submit Event (complet) =====================
 
-# ↳ Active le publish automatique si tu veux éviter l'admin
-AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "0") == "1"
-
-class EventSubmitIn(BaseModel):
-    # Contenu principal
-    title: str
-    title_mina: Optional[str] = None
-    description: Optional[str] = None
-    description_mina: Optional[str] = None
-
-    # Localisation
-    city: Optional[str] = None
-    venue_name: Optional[str] = None
-    address: Optional[str] = None
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-
-    # Dates / prix / visibilité
-    start_time: str
-    end_time: Optional[str] = None
-    price: Optional[str] = None
-    visibility: str = "local"   # 'local' | 'city' | 'national' | 'global'
-
-    # Contacts / média
-    contact_phone: Optional[str] = None
-    contact_url: Optional[str] = None
-    cover_url: Optional[str] = None
-
-    # Audio (2 voies)
-    audio_data: Optional[str] = None         # dataURL (fallback: upload côté backend)
-    audio_duration_ms: Optional[int] = None  # garde-fou (<= 30s)
-    audio_url: Optional[str] = None          # ✅ URL déjà uploadée via /api/upload_audio
+      # ✅ URL déjà uploadée via /api/upload_audio
 
 
 @app.post("/api/event_submit")
