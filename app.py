@@ -585,8 +585,9 @@ def _fmt_price(amount, currency, text_fallback=None):
     return (text_fallback or None)
 
 # ------------------------- Événements publics (API unifiée) -------------------------
+@app.get("/api/events_public")
 @app.post("/api/events_public")
-def api_events_public(q: EventsQuery, request: Request):
+def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
     """
     Source de vérité = table 'events'.
     - On sélectionne les champs utiles avec alias (start_time → starts_at, price → price_text).
@@ -758,7 +759,7 @@ def api_events_probe(limit: int = 5):
         rows = (
             supabase.table("events_api")
             .select("*")
-            .order("starts_at", desc=False)
+            .order("starts_at", desc=True)  # montre les plus récents d’abord
             .limit(max(1, min(limit, 50)))
             .execute()
         ).data or []
