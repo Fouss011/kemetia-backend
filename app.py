@@ -22,6 +22,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 AUDIO_WORKER_URL     = os.getenv("AUDIO_WORKER_URL", "https://kemetia-audio-worker.onrender.com").rstrip("/")
 USE_AUDIO_EMB        = os.getenv("USE_AUDIO_EMB", "1") == "1"
+AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "0") == "1"
 
 # Matching (ajustables via Render env)
 TEXT_SIM_THRESHOLD   = float(os.getenv("TEXT_SIM_THRESHOLD", "0.80"))
@@ -232,6 +233,7 @@ class EventSubmitIn(BaseModel):
     # audio optionnel
     audio_data: Optional[str] = None     # dataURL (webm/ogg/mp3…)
     audio_duration_ms: Optional[int] = None
+    audio_url: Optional[str] = None 
 
 class EventPublishIn(BaseModel):
     submission_id: int
@@ -582,76 +584,170 @@ def _fmt_price(amount, currency, text_fallback=None):
         pass
     return (text_fallback or None)
 
+# ------------------------- Événements publics (API unifiée) -------------------------
 @app.post("/api/events_public")
 def api_events_public(q: EventsQuery, request: Request):
     """
-    Lit la vue 'events_api' puis filtre en Python (dates + géo).
-    Si debug=1 (query string), renvoie l'erreur en clair au lieu d'un 500.
+    Source de vérité = table 'events'.
+    - On sélectionne les champs utiles avec alias (start_time → starts_at, price → price_text).
+    - On filtre côté Python: dates (now..now+horizon) + géo (si lat/lon fournis).
+    - Retour: { local: [...], national: [...], now: ISO }
+    
+    Query string ?debug=1 -> renvoie les erreurs en clair (utile en prod).
     """
     debug = (request.query_params.get("debug") == "1")
 
     if supabase is None:
         msg = "Supabase non configuré"
-        if debug: return {"local": [], "national": [], "now": datetime.now(timezone.utc).isoformat(), "error": msg}
+        if debug:
+            return {"local": [], "national": [], "now": datetime.now(timezone.utc).isoformat(), "error": msg}
         raise HTTPException(status_code=500, detail=msg)
 
+    # -- Fenêtre temporelle
     now = datetime.now(timezone.utc)
-    horizon = max(1, min(q.horizon_hours or 168, 24*14))
+    try:
+        horizon = int(q.horizon_hours or 168)
+    except Exception:
+        horizon = 168
+    horizon = max(1, min(horizon, 24 * 14))  # 1h .. 14 jours
     max_dt = now + timedelta(hours=horizon)
 
+    # -- Petits helpers locaux
+    def parse_iso(s):
+        if not s:
+            return None
+        try:
+            # accepte 'Z' ou offset explicite
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    # -- Champs à lire (alias PostgREST)
     FIELDS = ",".join([
-        "id","title","description","location_text","lat","lon",
-        "starts_at","is_national","price_amount","price_currency","price_text","audio_url"
+        "id",
+        "title",
+        "description",
+        "title_mina",
+        "description_mina",
+        "venue_name",
+        "address",
+        "city",
+        "lat",
+        "lon",
+        "location_text",
+        "starts_at:start_time",        # ✅ alias standardisé
+        "end_time",
+        "visibility",
+        "is_published",
+        "is_national",
+        "price_text:price",            # ✅ si tu stockes le prix libre en 'price'
+        "price_amount",
+        "price_currency",
+        "audio_url",
+        "cover_url",
     ])
 
-    def parse_iso(s):
-        if not s: return None
-        try: return datetime.fromisoformat(str(s).replace("Z","+00:00"))
-        except: return None
-
+    # -- Lecture DB
     try:
         raw = (
-            supabase.table("events_api")
+            supabase.table("events")
             .select(FIELDS)
-            .order("starts_at", desc=False)
+            .eq("is_published", True)          # on affiche seulement les publiés
+            .order("start_time", desc=False)   # tri ascendant par date
             .limit(1000)
             .execute()
         ).data or []
     except Exception as e:
-        if debug: return {"local": [], "national": [], "now": now.isoformat(), "error": f"DB read fail: {e!r}"}
+        if debug:
+            return {"local": [], "national": [], "now": now.isoformat(), "error": f"DB read fail: {e!r}"}
         raise HTTPException(status_code=500, detail="DB read fail")
 
+    # -- Normalisation / filtres
     try:
         normalized = []
         for r in raw:
-            dt = parse_iso(r.get("starts_at"))
+            dt = r.get("starts_at")
+            if isinstance(dt, datetime):
+                pass
+            else:
+                dt = parse_iso(dt)
+
+            # Filtre fenêtre temporelle
             if not dt or not (now <= dt <= max_dt):
                 continue
-            r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
-            if isinstance(r.get("starts_at"), datetime):
-                r["starts_at"] = r["starts_at"].isoformat()
-            normalized.append(r)
 
+            # Location text fallback (si vide)
+            loc_txt = r.get("location_text")
+            if not (isinstance(loc_txt, str) and loc_txt.strip()):
+                loc_txt = " · ".join([x for x in [
+                    (r.get("venue_name") or "").strip(),
+                    (r.get("address") or "").strip(),
+                    (r.get("city") or "").strip()
+                ] if x]) or None
+
+            # Prix affichable
+            price_disp = _fmt_price(
+                r.get("price_amount"),
+                r.get("price_currency"),
+                r.get("price_text")
+            )
+
+            # starts_at en ISO
+            starts_at_iso = dt.isoformat()
+
+            # Copie nettoyée
+            it = dict(r)
+            it["location_text"] = loc_txt
+            it["price_display"] = price_disp
+            it["starts_at"] = starts_at_iso
+            normalized.append(it)
+
+        # -- Séparation national / local
+        # National = taggé national (ou global) -> on ordonne par date
         nat = [r for r in normalized if bool(r.get("is_national"))]
         nat.sort(key=lambda r: (r.get("starts_at") or ""))
 
+        # Local = si coords fournies -> on filtre par rayon
         loc = []
         if q.lat is not None and q.lon is not None:
             blat, blon = float(q.lat), float(q.lon)
-            rad = float(q.radius_m or 5000)
+            try:
+                rad = float(q.radius_m or 5000.0)
+            except Exception:
+                rad = 5000.0
+
             for r in normalized:
                 try:
-                    d = _haversine(blat, blon, float(r["lat"]), float(r["lon"]))
+                    if r.get("lat") is None or r.get("lon") is None:
+                        continue
+                    d = _haversine(
+                        blat, blon,
+                        float(r["lat"]), float(r["lon"])
+                    )
                 except Exception:
                     continue
                 if d <= rad:
-                    r2 = dict(r); r2["distance_m"] = int(d); loc.append(r2)
+                    r2 = dict(r)
+                    r2["distance_m"] = int(d)
+                    loc.append(r2)
+
             loc.sort(key=lambda r: (r.get("distance_m", 10**9), r.get("starts_at") or ""))
 
-        return {"local": loc[:100], "national": nat[:100], "now": now.isoformat()}
+        return {
+            "local": loc[:100],
+            "national": nat[:100],
+            "now": now.isoformat()
+        }
+
     except Exception as e:
         if debug:
-            return {"local": [], "national": [], "now": now.isoformat(), "error": f"postproc fail: {e!r}", "raw_count": len(raw)}
+            return {
+                "local": [],
+                "national": [],
+                "now": now.isoformat(),
+                "error": f"postproc fail: {e!r}",
+                "raw_count": len(raw)
+            }
         raise HTTPException(status_code=500, detail="postproc fail")
 
 @app.get("/api/events_probe")
@@ -695,58 +791,198 @@ def api_event_detail(event_id: int):
     return it
 
 # ------------------------- Submit Event -------------------------
+# ===================== Submit Event (complet) =====================
+
+# ↳ Active le publish automatique si tu veux éviter l'admin
+AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "0") == "1"
+
+class EventSubmitIn(BaseModel):
+    # Contenu principal
+    title: str
+    title_mina: Optional[str] = None
+    description: Optional[str] = None
+    description_mina: Optional[str] = None
+
+    # Localisation
+    city: Optional[str] = None
+    venue_name: Optional[str] = None
+    address: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+    # Dates / prix / visibilité
+    start_time: str
+    end_time: Optional[str] = None
+    price: Optional[str] = None
+    visibility: str = "local"   # 'local' | 'city' | 'national' | 'global'
+
+    # Contacts / média
+    contact_phone: Optional[str] = None
+    contact_url: Optional[str] = None
+    cover_url: Optional[str] = None
+
+    # Audio (2 voies)
+    audio_data: Optional[str] = None         # dataURL (fallback: upload côté backend)
+    audio_duration_ms: Optional[int] = None  # garde-fou (<= 30s)
+    audio_url: Optional[str] = None          # ✅ URL déjà uploadée via /api/upload_audio
+
+
 @app.post("/api/event_submit")
 def api_event_submit(inp: EventSubmitIn):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
-    vis = (inp.visibility or "local").lower()
-    if vis not in ("local","city","national","global"): vis = "local"
 
-    # audio (optionnel) : limite 30s, upload storage
-    audio_url = None
-    if inp.audio_data:
+    # --- Normalisation visibilité
+    vis = (inp.visibility or "local").lower().strip()
+    if vis not in ("local", "city", "national", "global"):
+        vis = "local"
+
+    # --- Champs obligatoires
+    if not (inp.title or "").strip():
+        raise HTTPException(status_code=400, detail="title requis")
+    if not (inp.start_time or "").strip():
+        raise HTTPException(status_code=400, detail="start_time requis")
+
+    # --- Gestion Audio
+    audio_url: Optional[str] = None
+
+    if inp.audio_url:
+        # 1) Cas simple : l’URL publique a déjà été obtenue via /api/upload_audio
+        audio_url = (inp.audio_url or "").strip() or None
+
+    elif inp.audio_data:
+        # 2) Fallback : on reçoit un dataURL → on uploade dans le bucket 'events-audio'
         dur = int(inp.audio_duration_ms or 0)
-        if dur <= 0 or dur > 31000:
+        if dur <= 0 or dur > 31_000:
             raise HTTPException(status_code=400, detail="audio trop long (>30s)")
+
         try:
             header, b64 = inp.audio_data.split(",", 1)
             raw = base64.b64decode(b64)
+
+            # Déduire l’extension/mime
+            mime = "audio/webm"
+            try:
+                mime = header.split(";")[0].split(":", 1)[1] or "audio/webm"
+            except Exception:
+                pass
+
             ext = ".webm"
-            if "audio/ogg" in header: ext = ".ogg"
-            elif "audio/mp3" in header or "mpeg" in header: ext = ".mp3"
-            elif "audio/mp4" in header or "m4a" in header: ext = ".m4a"
+            hl = header.lower()
+            if "audio/ogg" in hl:                   ext = ".ogg"
+            elif "audio/mp3" in hl or "mpeg" in hl: ext = ".mp3"
+            elif "audio/mp4" in hl or "m4a" in hl:  ext = ".m4a"
+            elif "audio/wav" in hl:                 ext = ".wav"
+
             name = f"{uuid4().hex}{ext}"
             bucket = supabase.storage.from_("events-audio")
-            bucket.upload(name, raw, {"content-type": header.split(";")[0].split(":",1)[1]})
+            bucket.upload(name, raw, {"content-type": mime, "cache-control": "3600"})
             audio_url = bucket.get_public_url(name)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"upload audio fail: {e}")
 
-    row = {
+            if not isinstance(audio_url, str) or not audio_url:
+                raise RuntimeError("public URL vide après upload")
+
+        except Exception as e:
+            msg = str(e)
+            if "Bucket not found" in msg or "No such bucket" in msg:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Bucket 'events-audio' introuvable. Crée-le dans Supabase Storage (public).",
+                )
+            raise HTTPException(status_code=500, detail=f"upload audio fail: {msg}")
+
+    # --- Insertion de la proposition
+    sub_row = {
         "title": (inp.title or "").strip(),
-        "title_mina": inp.title_mina,
-        "description": inp.description,
-        "description_mina": inp.description_mina,
-        "city": inp.city,
-        "venue_name": inp.venue_name,
-        "address": inp.address,
-        "lat": inp.lat, "lon": inp.lon,
-        "start_time": inp.start_time, "end_time": inp.end_time,
-        "price": inp.price, "visibility": vis,
-        "contact_phone": inp.contact_phone, "contact_url": inp.contact_url,
-        "cover_url": inp.cover_url,
-        "accepted": None,
-        "audio_url": audio_url,
+        "title_mina": (inp.title_mina or None),
+        "description": (inp.description or None),
+        "description_mina": (inp.description_mina or None),
+        "city": (inp.city or None),
+        "venue_name": (inp.venue_name or None),
+        "address": (inp.address or None),
+        "lat": inp.lat,
+        "lon": inp.lon,
+        "start_time": inp.start_time,
+        "end_time": inp.end_time,
+        "price": (inp.price or None),
+        "visibility": vis,
+        "contact_phone": (inp.contact_phone or None),
+        "contact_url": (inp.contact_url or None),
+        "cover_url": (inp.cover_url or None),
+        "accepted": None,          # en attente
+        "is_reviewed": False,
+        "is_approved": False,
+        "audio_url": audio_url,    # ✅ on stocke l’URL (ou None)
     }
-    if not row["title"] or not row["start_time"]:
-        raise HTTPException(status_code=400, detail="title et start_time requis")
 
     try:
-        res = supabase.table("event_submissions").insert(row).execute()
+        ins = supabase.table("event_submissions").insert(sub_row).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not res.data: raise HTTPException(status_code=500, detail="Insert proposition échoué")
-    return {"ok": True, "submission_id": res.data[0]["id"]}
+        raise HTTPException(status_code=500, detail=f"insert submissions fail: {e}")
+
+    if not ins.data:
+        raise HTTPException(status_code=500, detail="Insert proposition échoué")
+
+    submission = ins.data[0]
+    out = {"ok": True, "submission_id": submission["id"]}
+
+    # --- Optionnel : publish automatique (bypass admin)
+    if AUTO_PUBLISH:
+        try:
+            # Calcule un location_text propre (fallback si pas défini par ailleurs)
+            location_text = " · ".join(
+                x for x in [
+                    (submission.get("venue_name") or "").strip(),
+                    (submission.get("address") or "").strip(),
+                    (submission.get("city") or "").strip(),
+                ]
+                if x
+            ) or None
+
+            pub = {
+                "title":            submission.get("title"),
+                "title_mina":       submission.get("title_mina"),
+                "description":      submission.get("description"),
+                "description_mina": submission.get("description_mina"),
+                "city":             submission.get("city"),
+                "venue_name":       submission.get("venue_name"),
+                "address":          submission.get("address"),
+                "lat":              submission.get("lat"),
+                "lon":              submission.get("lon"),
+                "start_time":       submission.get("start_time"),
+                "end_time":         submission.get("end_time"),
+                "price":            submission.get("price"),
+                "visibility":       vis,
+                "audio_url":        submission.get("audio_url"),
+                "is_published":     True,
+                "is_national":      True if vis in ("national","global") else False,
+                "location_text":    location_text,
+                "price_currency":   "XOF",
+            }
+            # Garder des clés nulles explicites si besoin (end_time/price)
+            pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time", "price")}
+
+            ev_ins = supabase.table("events").insert(pub).execute()
+            if ev_ins.data:
+                out["event_id"] = ev_ins.data[0]["id"]
+
+            # marque la soumission comme acceptée
+            supabase.table("event_submissions").update({
+                "accepted": True,
+                "is_reviewed": True,
+                "is_approved": True,
+                "admin_note": "auto-publish",
+            }).eq("id", submission["id"]).execute()
+
+            out["published"] = True
+
+        except Exception as e:
+            # on ne casse pas la réponse en cas d'échec d’auto-publish
+            out["published"] = False
+            out["warn"] = f"auto-publish fail: {e}"
+
+    return out
+
 
 @app.get("/api/submissions_probe")
 def submissions_probe(limit: int = 5):
