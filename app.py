@@ -212,6 +212,7 @@ class EventsQuery(BaseModel):
     lon: float | None = None
     radius_m: int = 5000
     horizon_hours: int = 168   # 7 jours
+    country: str | None = None
 
 class EventSubmitIn(BaseModel):
     title: str
@@ -251,8 +252,7 @@ INTRO_MINA = (
 )
 
 FALLBACK_MINA = (
-    "moudékoukou gnémoukpolé wo édowanwo ! "
-    "néolé dji pharmacie alo restaurant alo hotel, noudoudou tchan maté sowososawo apké!"
+    "moudékoukou, né olédji hotel gblonbé moulé dji hotel, alo restaurant olédjia? gblonbé moulédji restaurant. nouké olédjia gbloinnam !"
 )
 
 PHRASES_MINA = {
@@ -344,14 +344,72 @@ def api_chat(inp: ChatIn):
     user_text = (inp.text or "").strip()
     if user_text == "" and not inp.from_audio:
         return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
+    
+    @app.post("/api/chat")
+def api_chat(inp: ChatIn):
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
 
-    # 1) INTENTS MINA (règles locales, prioritaire)
+    user_text = (inp.text or "").strip()
+
+    # ===== ➊ PIPELINE AUDIO (si from_audio ou audio fourni) =====
+    if (inp.from_audio or inp.audio) and isinstance(inp.audio, str) and inp.audio.startswith("data:"):
+        try:
+            # 1) embedding audio via worker
+            avec = _embedding_via_worker(inp.audio)
+            if not avec:
+                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:no-vec"}
+
+            # 2) top-k match en DB (pgvector)
+            rpc = supabase.rpc("match_audio_by_vector", {
+                "p_lang": (inp.sourceLang or "mina").lower(),
+                "p_query": avec,
+                "p_limit": 5
+            }).execute()
+            rows = rpc.data or []
+            # convertir distance -> similarité
+            for r in rows:
+                r["sim"] = 1.0 - float(r.get("distance", 1.0))
+
+            best = max(rows, key=lambda r: r.get("sim", 0.0), default=None)
+            if not best:
+                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:empty"}
+
+            if best["sim"] < AUDIO_SIM_THRESHOLD:
+                # si seuil non atteint → message “dis ce que tu veux”
+                return {"reply": FALLBACK_MINA, "row_id": best.get("id"), "mode": f"audio:low({best['sim']:.2f})"}
+
+            # 3) construire la réponse
+            # priorité: reply_same (même langue) > fr > en > text de la base
+            reply = (
+                (best.get("reply_same") or "").strip()
+                or (best.get("fr") or "").strip()
+                or (best.get("en") or "").strip()
+                or (best.get("text") or "").strip()
+                or FALLBACK_MINA
+            )
+            return {
+                "reply": reply,
+                "row_id": best.get("id"),
+                "mode": f"audio:match({best['sim']:.2f})",
+                "meta": {"sim": best.get("sim")}
+            }
+        except Exception as e:
+            print("audio-match err:", e)
+            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:error"}
+
+    # ===== ➋ INTRO FORCÉE si aucun texte (appel initial du front)
+    if user_text == "" and not inp.from_audio:
+        return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
+
+    # ===== ➌ INTENTS MINA (texte)
     intent, rule_reply = _match_intent_mina(user_text)
     if intent and rule_reply:
         return {"reply": rule_reply, "row_id": None, "mode": f"rule:{intent}"}
 
-    # 2) FALLBACK MINA si non prévu
+    # ===== ➍ FALLBACK (texte incompris)
     return {"reply": FALLBACK_MINA, "row_id": None, "mode": "fallback"}
+
 
 # ------------------------- Collect -------------------------
 @app.post("/api/collect")
@@ -648,6 +706,7 @@ def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
         "cover_url",
         "contact_phone",
         "contact_url",
+        "country_code"
     ])
 
     # -- Lecture DB
@@ -704,7 +763,12 @@ def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
             it["price_display"] = price_disp
             it["starts_at"] = starts_at_iso
             normalized.append(it)
-
+            
+        # ---- << COLLER ICI le filtre pays >> ----
+        country = (q.country or "").strip().upper()
+        if country:
+            normalized = [r for r in normalized if (str(r.get("country_code") or "").upper() == country)]
+# ---- >> FIN DU FILTRE PAYS ----
         # -- Séparation national / local
         # National = taggé national (ou global) -> on ordonne par date
         nat = [r for r in normalized if bool(r.get("is_national"))]
@@ -1092,6 +1156,10 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         # 👉 contacts
         "contact_phone":    sub.get("contact_phone"),
         "contact_url":      sub.get("contact_url"),
+        "country_code": sub.get("country_code") or None,
+        "contact_phone": sub.get("contact_phone"),
+        "contact_url":   sub.get("contact_url"),
+
     }
     pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
 
