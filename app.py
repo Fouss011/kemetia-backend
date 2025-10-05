@@ -646,6 +646,8 @@ def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
         "price_currency",
         "audio_url",
         "cover_url",
+        "contact_phone",
+        "contact_url",
     ])
 
     # -- Lecture DB
@@ -1087,6 +1089,9 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         "is_national":      True if vis in ("national","global") else False,
         "location_text":    (sub.get("venue_name") or sub.get("address") or sub.get("city") or None),
         "price_currency":   "XOF",
+        # 👉 contacts
+        "contact_phone":    sub.get("contact_phone"),
+        "contact_url":      sub.get("contact_url"),
     }
     pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
 
