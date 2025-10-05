@@ -346,9 +346,12 @@ def api_chat(inp: ChatIn):
     user_text = (inp.text or "").strip()
     is_audio = bool(inp.from_audio or inp.audio)
 
+    intent = None
+    sim = None
+    row_id = None
+
     # 1) PIPELINE AUDIO
     if is_audio and isinstance(inp.audio, str) and inp.audio.startswith("data:"):
-        # 1a) Matching audio
         try:
             avec = _embedding_via_worker(inp.audio)
         except Exception as e:
@@ -371,6 +374,8 @@ def api_chat(inp: ChatIn):
                 print("RPC match_audio_by_vector err:", e)
 
         if best and best.get("sim", 0.0) >= AUDIO_SIM_THRESHOLD:
+            sim = float(best["sim"])
+            row_id = best.get("id")
             reply = (
                 (best.get("reply_same") or "").strip()
                 or (best.get("fr") or "").strip()
@@ -378,13 +383,23 @@ def api_chat(inp: ChatIn):
                 or (best.get("text") or "").strip()
                 or FALLBACK_MINA
             )
-            return {"reply": reply, "row_id": best.get("id"), "mode": f"audio:match({best['sim']:.2f})"}
+            # petit extract d’intent côté backend (fiable pour le front)
+            it, _ = _match_intent_mina(reply)
+            intent = it
+            trigger = f"nearby:{'food' if intent=='restaurant' else intent}" if intent in ("pharmacy","restaurant") else None
+            return {
+                "reply": reply,
+                "row_id": row_id,
+                "mode": f"audio:match({sim:.2f})",
+                "intent": intent,
+                "sim": sim,
+                "trigger": trigger
+            }
 
-        # 1b) HARD_AUDIO_ONLY => pas de STT
         if HARD_AUDIO_ONLY:
-            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:hard-fallback"}
+            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:hard-fallback", "intent": None, "sim": None, "trigger": None}
 
-        # 1c) STT fallback
+        # STT fallback
         if openai_client:
             try:
                 header, b64 = inp.audio.split(",", 1)
@@ -401,39 +416,38 @@ def api_chat(inp: ChatIn):
                 elif "wav"  in mime: ext = ".wav"
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-                    f.write(raw)
-                    tmp_path = f.name
+                    f.write(raw); tmp_path = f.name
                 try:
                     with open(tmp_path, "rb") as fh:
                         tr = openai_client.audio.transcriptions.create(model="whisper-1", file=fh)
                     stt_text = (getattr(tr, "text", "") or "").strip()
                 finally:
-                    try:
-                        os.remove(tmp_path)
-                    except:
-                        pass
+                    try: os.remove(tmp_path)
+                    except: pass
 
                 if stt_text:
                     user_text = stt_text
                 else:
-                    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-empty"}
+                    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-empty", "intent": None, "sim": None, "trigger": None}
             except Exception as e:
                 print("STT fallback err:", repr(e))
-                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-error"}
+                return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:stt-error", "intent": None, "sim": None, "trigger": None}
         else:
-            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:no-openai"}
+            return {"reply": FALLBACK_MINA, "row_id": None, "mode": "audio:no-openai", "intent": None, "sim": None, "trigger": None}
 
-    # 2) INTRO si pas de texte
+    # 2) INTRO
     if user_text == "" and not is_audio:
-        return {"reply": INTRO_MINA, "row_id": None, "mode": "intro"}
+        return {"reply": INTRO_MINA, "row_id": None, "mode": "intro", "intent": None, "sim": None, "trigger": None}
 
-    # 3) RÈGLES (texte)
+    # 3) RÈGLES TEXTE
     intent, rule_reply = _match_intent_mina(user_text)
     if intent and rule_reply:
-        return {"reply": rule_reply, "row_id": None, "mode": f"rule:{intent}"}
+        trigger = f"nearby:{'food' if intent=='restaurant' else intent}" if intent in ("pharmacy","restaurant") else None
+        return {"reply": rule_reply, "row_id": None, "mode": f"rule:{intent}", "intent": intent, "sim": None, "trigger": trigger}
 
     # 4) FALLBACK
-    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "fallback"}
+    return {"reply": FALLBACK_MINA, "row_id": None, "mode": "fallback", "intent": None, "sim": None, "trigger": None}
+
 
 
 
