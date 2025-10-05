@@ -807,8 +807,13 @@ def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
         # ---- << COLLER ICI le filtre pays >> ----
         country = (q.country or "").strip().upper()
         if country:
-            normalized = [r for r in normalized if (str(r.get("country_code") or "").upper() == country)]
+    # TEMPORAIRE : inclure aussi les events sans code pays (NULL/"")
+            normalized = [
+                r for r in normalized
+                if (str(r.get("country_code") or "").upper() == country) or (r.get("country_code") in (None, ""))
+            ]
 # ---- >> FIN DU FILTRE PAYS ----
+
         # -- Séparation national / local
         # National = taggé national (ou global) -> on ordonne par date
         nat = [r for r in normalized if bool(r.get("is_national"))]
@@ -1164,7 +1169,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         # 👉 contacts
         "contact_phone":    sub.get("contact_phone"),
         "contact_url":      sub.get("contact_url"),
-        "country_code": sub.get("country_code") or None,
+        "country_code": sub.get("country_code") or pub.get("country_code") or "TG",
         "contact_phone": sub.get("contact_phone"),
         "contact_url":   sub.get("contact_url"),
 
