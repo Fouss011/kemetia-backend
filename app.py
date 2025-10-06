@@ -235,6 +235,8 @@ class EventSubmitIn(BaseModel):
     audio_data: Optional[str] = None     # dataURL (webm/ogg/mp3…)
     audio_duration_ms: Optional[int] = None
     audio_url: Optional[str] = None 
+    images_urls: Optional[List[str]] = None        # URLs déjà uploadées
+    images_data: Optional[List[str]] = None        # dataURL (optionnel)
 
 class EventPublishIn(BaseModel):
     submission_id: int
@@ -615,6 +617,48 @@ async def upload_audio(file: UploadFile = File(...)):
                 detail="Bucket not found: crée le bucket 'kemetia-audio' dans Supabase Storage (public)"
             )
         raise HTTPException(status_code=500, detail=f"Upload fail: {msg}")
+    
+@app.post("/api/upload_image")
+async def upload_image(file: UploadFile = File(...)):
+    """
+    Upload d'une image d'illustration d'évènement.
+    Stocké dans le bucket public 'events-media' (dossier events/).
+    Retourne l'URL publique.
+    """
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Fichier vide")
+
+    ct = (file.content_type or "").lower()
+    if not ct.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Content-Type image/* requis")
+
+    ext = ".jpg"
+    if "png" in ct:  ext = ".png"
+    if "jpeg" in ct: ext = ".jpg"
+    if "webp" in ct: ext = ".webp"
+
+    key = f"events/{uuid4()}{ext}"
+    BUCKET = "events-media"
+
+    try:
+        supabase.storage.from_(BUCKET).upload(
+            key, data,
+            file_options={"content-type": ct, "cache-control":"3600", "upsert":"false"}
+        )
+        url = supabase.storage.from_(BUCKET).get_public_url(key)
+        if not url:
+            raise RuntimeError("public URL vide")
+        return {"url": url, "bucket": BUCKET, "key": key, "content_type": ct}
+    except Exception as e:
+        msg = str(e)
+        if "Bucket not found" in msg or "No such bucket" in msg:
+            raise HTTPException(400, "Bucket 'events-media' introuvable (créé-le en public).")
+        raise HTTPException(500, f"Upload image fail: {msg}")
+
 
 @app.post("/api/events_admin/delete")
 def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
@@ -823,7 +867,8 @@ def api_events_public(q: EventsQuery = EventsQuery(), request: Request = None):
         "cover_url",
         "contact_phone",
         "contact_url",
-        "country_code"
+        "country_code",
+        "images",
     ])
 
     # -- Lecture DB
@@ -1047,6 +1092,36 @@ def api_event_submit(inp: EventSubmitIn):
                     detail="Bucket 'events-audio' introuvable. Crée-le dans Supabase Storage (public).",
                 )
             raise HTTPException(status_code=500, detail=f"upload audio fail: {msg}")
+    
+        # --- IMAGES (multi)
+    images_urls: List[str] = []
+    # a) URLs directes
+    if inp.images_urls:
+        for u in inp.images_urls:
+            if isinstance(u, str) and u.startswith("http"):
+                images_urls.append(u)
+
+    # b) dataURL -> upload
+    if inp.images_data:
+        for durl in inp.images_data[:4]:  # limite 4 images
+            try:
+                head, b64 = durl.split(",", 1)
+                raw = base64.b64decode(b64)
+                mime = "image/jpeg"
+                try: mime = head.split(";")[0].split(":",1)[1] or "image/jpeg"
+                except: pass
+                ext = ".jpg"
+                if "png" in mime:  ext = ".png"
+                if "webp" in mime: ext = ".webp"
+
+                name = f"events/{uuid4()}{ext}"
+                bucket = supabase.storage.from_("events-media")
+                bucket.upload(name, raw, {"content-type": mime, "cache-control":"3600"})
+                url = bucket.get_public_url(name)
+                if url: images_urls.append(url)
+            except Exception as e:
+                print("image upload fail:", e)
+
 
     # --- Insertion de la proposition
     sub_row = {
@@ -1069,7 +1144,8 @@ def api_event_submit(inp: EventSubmitIn):
         "accepted": None,          # en attente
         "is_reviewed": False,
         "is_approved": False,
-        "audio_url": audio_url,    # ✅ on stocke l’URL (ou None)
+        "audio_url": audio_url,
+        "images": images_urls or [],    # ✅ on stocke l’URL (ou None)
     }
 
     try:
@@ -1249,6 +1325,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         "country_code": sub.get("country_code") or pub.get("country_code") or "TG",
         "contact_phone": sub.get("contact_phone"),
         "contact_url":   sub.get("contact_url"),
+        "images": sub.get("images") or [],
 
     }
     pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
