@@ -1275,17 +1275,19 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase non configuré")
 
+    # --- Auth admin
     auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
     token = auth.replace("Bearer", "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # --- Récupérer la soumission
     r = supabase.table("event_submissions").select("*").eq("id", inp.submission_id).limit(1).execute()
     sub = (r.data or [None])[0]
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    # Refus
+    # --- Cas refus
     if not inp.accept:
         supabase.table("event_submissions").update({
             "accepted": False,
@@ -1295,11 +1297,21 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         }).eq("id", inp.submission_id).execute()
         return {"ok": True, "published": False}
 
-    # Fallback visibility
+    # --- Visibilité
     vis = (sub.get("visibility") or "local").lower()
     if vis not in ("local","city","national","global"):
         vis = "local"
 
+    # --- Fallback location_text propre
+    location_text = " · ".join(
+        x for x in [
+            (sub.get("venue_name") or "").strip(),
+            (sub.get("address") or "").strip(),
+            (sub.get("city") or "").strip(),
+        ] if x
+    ) or (sub.get("venue_name") or sub.get("address") or sub.get("city") or None)
+
+    # --- Construire la ligne pour 'events' (✅ cover_url + contacts + pays)
     pub = {
         "title":            sub.get("title"),
         "title_mina":       sub.get("title_mina"),
@@ -1315,21 +1327,19 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         "price":            sub.get("price"),
         "visibility":       vis,
         "audio_url":        sub.get("audio_url"),
+        "cover_url":        sub.get("cover_url"),        # ✅ image
+        "contact_phone":    sub.get("contact_phone"),    # ✅ téléphone
+        "contact_url":      sub.get("contact_url"),      # ✅ lien
+        "country_code":     sub.get("country_code"),     # ✅ pays si présent
         "is_published":     True,
         "is_national":      True if vis in ("national","global") else False,
-        "location_text":    (sub.get("venue_name") or sub.get("address") or sub.get("city") or None),
+        "location_text":    location_text,
         "price_currency":   "XOF",
-        # 👉 contacts
-        "contact_phone":    sub.get("contact_phone"),
-        "contact_url":      sub.get("contact_url"),
-        "country_code": sub.get("country_code") or pub.get("country_code") or "TG",
-        "contact_phone": sub.get("contact_phone"),
-        "contact_url":   sub.get("contact_url"),
-        "images": sub.get("images") or [],
-
     }
+    # Conserver explicitement les champs null autorisés
     pub = {k: v for k, v in pub.items() if v is not None or k in ("end_time","price")}
 
+    # --- Insert dans events
     try:
         ins = supabase.table("events").insert(pub).execute()
         if not ins.data:
@@ -1338,6 +1348,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
     except Exception as e:
         return {"ok": False, "error": f"insert events fail: {e}"}
 
+    # --- Marquer la soumission comme publiée
     try:
         supabase.table("event_submissions").update({
             "accepted": True,
@@ -1349,6 +1360,7 @@ def api_events_admin_publish(inp: EventPublishIn, request: Request):
         return {"ok": True, "published": True, "event_id": new_id, "warn": f"submission update fail: {e!r}"}
 
     return {"ok": True, "published": True, "event_id": new_id}
+
 
 # ---------- Event short announce (TTS ~30s) ----------
 def _announce_text(ev: dict) -> str:
