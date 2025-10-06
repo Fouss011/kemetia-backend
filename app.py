@@ -625,6 +625,83 @@ def api_delete_event(req: EventId, authorization: Optional[str] = Header(None)):
         return {"ok": True, "deleted_id": req.event_id}
     except Exception as e:
         raise HTTPException(500, f"delete fail: {e}")
+    
+# ---- ADMIN: lister publiés & refusés (avec filtre pays optionnel) ----
+@app.get("/api/events_admin/list_all")
+def api_events_admin_list_all(request: Request, country: str | None = None, horizon_days: int = 14, limit: int = 500):
+    """
+    Retourne:
+      - published: événements publiés (table events), dans la fenêtre temporelle (par défaut 14j)
+      - rejected:  propositions refusées (table event_submissions où accepted=false)
+    Filtre optionnel par code pays (country_code), et horizon ajustable.
+    """
+    if supabase is None:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    token = auth.replace("Bearer", "").strip()
+    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # bornes temporelles pour published
+    now = datetime.now(timezone.utc)
+    horizon_days = max(1, min(int(horizon_days or 14), 90))  # 1..90 jours
+    max_dt = now + timedelta(days=horizon_days)
+
+    def parse_iso(s):
+        if not s: return None
+        try: return datetime.fromisoformat(str(s).replace("Z","+00:00"))
+        except: return None
+
+    # --- published (events)
+    FIELDS = ",".join([
+        "id","title","description","title_mina","description_mina",
+        "venue_name","address","city","lat","lon","location_text",
+        "starts_at:start_time","end_time","visibility","is_published","is_national",
+        "price_text:price","price_amount","price_currency",
+        "audio_url","cover_url","contact_phone","contact_url","country_code"
+    ])
+
+    try:
+        q = supabase.table("events").select(FIELDS).eq("is_published", True).order("start_time", desc=False).limit(limit)
+        res = q.execute(); rows = res.data or []
+    except Exception as e:
+        rows = []
+        print("events_admin.list_all events error:", e)
+
+    # filtre date + pays
+    pub = []
+    cc = (country or "").strip().upper()
+    for r in rows:
+        dt = r.get("starts_at")
+        if not isinstance(dt, datetime):
+            dt = parse_iso(dt)
+        if not dt or not (now <= dt <= max_dt):
+            continue
+        if cc and (str(r.get("country_code") or "").upper() != cc):
+            continue
+        r["price_display"] = _fmt_price(r.get("price_amount"), r.get("price_currency"), r.get("price_text"))
+        if isinstance(r.get("starts_at"), datetime):
+            r["starts_at"] = r["starts_at"].isoformat()
+        pub.append(r)
+
+    # --- rejected (event_submissions)
+    try:
+        q2 = (supabase.table("event_submissions")
+              .select("*")
+              .eq("is_reviewed", True)
+              .eq("is_approved", False)
+              .order("created_at", desc=True)
+              .limit(limit))
+        rej = q2.execute().data or []
+        if cc:
+            rej = [x for x in rej if (str(x.get("country_code") or "").upper() == cc)]
+    except Exception as e:
+        rej = []
+        print("events_admin.list_all submissions error:", e)
+
+    return {"published": pub, "rejected": rej, "count_published": len(pub), "count_rejected": len(rej)}
+
 
 # ------------------------- Nearby (OSM) -------------------------
 def _osm_query_for(kind: str) -> str:
