@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 from uuid import uuid4
+import hashlib
 
 # ------------------------- Config -------------------------
 load_dotenv()
@@ -31,6 +32,8 @@ HARD_AUDIO_ONLY      = os.getenv("HARD_AUDIO_ONLY", "1") == "1"  # “radical au
 
 # Token admin pour modération d’évènements
 ADMIN_TOKEN          = os.getenv("ADMIN_TOKEN", "")
+TTS_VOICE = os.getenv("TTS_VOICE", "aria")  # voix féminine par défaut si dispo
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
 
 # Clients
 supabase: Optional[Client] = None
@@ -1388,11 +1391,9 @@ def _tts_b64_for_event(event_id: int) -> str:
     txt = _announce_text(ev)
     try:
         speech = openai_client.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice="alloy",
-            input=txt,
-            format="mp3"
-        )
+        model=TTS_MODEL, voice=TTS_VOICE, input=txt, format="mp3"
+    )
+
         mp3_bytes = speech.content  # bytes
     except Exception:
         with openai_client.audio.speech.with_streaming_response.create(
@@ -1421,3 +1422,46 @@ def api_compute_audio_embedding(payload: dict):
     vec = _embedding_via_worker(data_url)
     if not vec: raise HTTPException(status_code=500, detail="embedding vide")
     return {"embedding": vec, "dim": len(vec)}
+
+from functools import lru_cache
+import hashlib
+
+def _tts_cache_key(text: str, voice: str, model: str, rate: float) -> str:
+    h = hashlib.sha1(f"{voice}|{model}|{rate:.2f}|{text}".encode("utf-8")).hexdigest()
+    return h
+
+@lru_cache(maxsize=512)
+def _tts_b64_cached(text: str, voice: str, model: str, rate: float) -> str:
+    # NB: certains TTS n’exposent pas "rate", on le laisse au modèle par défaut
+    speech = openai_client.audio.speech.create(
+        model=model, voice=voice, input=text, format="mp3"
+    )
+    mp3_bytes = getattr(speech, "content", None)
+    if not mp3_bytes:
+        # fallback streaming si nécessaire
+        with openai_client.audio.speech.with_streaming_response.create(
+            model=model, voice=voice, input=text
+        ) as resp:
+            mp3_bytes = resp.read()
+    return base64.b64encode(mp3_bytes).decode("ascii")
+
+@app.post("/api/tts_chat")
+def api_tts_chat(payload: dict):
+    if not openai_client:
+        raise HTTPException(status_code=501, detail="TTS non configuré (OPENAI_API_KEY manquant)")
+    text = (payload or {}).get("text") or ""
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="text requis")
+    voice = (payload or {}).get("voice") or TTS_VOICE
+    model = (payload or {}).get("model") or TTS_MODEL
+    rate = float((payload or {}).get("rate") or 1.0)  # réservé si on étend
+
+    try:
+        b64 = _tts_b64_cached(text, voice, model, rate)
+        return {
+            "audio": f"data:audio/mpeg;base64,{b64}",
+            "voice_used": voice,
+            "model": model
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS error: {e}")
