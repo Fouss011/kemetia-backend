@@ -1015,6 +1015,7 @@ def diag_versions():
         "httpx": v("httpx")
     }
 
+
 @app.get("/api/events/{event_id}")
 def api_event_detail(event_id: int):
     if supabase is None:
@@ -1026,6 +1027,90 @@ def api_event_detail(event_id: int):
     if isinstance(it.get("starts_at"), datetime):
         it["starts_at"] = it["starts_at"].isoformat()
     return it
+# --- PRO: lecture publique de profils ---------------------------------------
+from fastapi import Query
+
+def _sb_headers(service: bool = False):
+    """Récupère les headers Supabase (service si dispo, sinon anon)."""
+    import os
+    anon = getattr(SET, "SUPABASE_ANON_KEY", None) or os.getenv("SUPABASE_ANON_KEY")
+    svc  = getattr(SET, "SUPABASE_SERVICE_KEY", None) or os.getenv("SUPABASE_SERVICE_KEY")
+    key  = (svc if service else anon) or anon
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+
+def _sb_url(path: str) -> str:
+    import os
+    base = getattr(SET, "SUPABASE_URL", None) or os.getenv("SUPABASE_URL")
+    return f"{base.rstrip('/')}{path}"
+
+@app.get("/api/pro_public")
+def api_pro_public(
+    id: str | None = None,
+    slug: str | None = None,
+    sector: str | None = None,
+    city: str | None = None,
+    q: str | None = None,
+    lat: float | None = None,
+    lon: float | None = None,
+    radius_km: float | None = None,
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """
+    Liste les profils PRO.
+    - Filtres: id, slug, sector, city, q (recherche nom/ville)
+    - Option 'nearby' côté serveur (sans PostGIS): lat, lon, radius_km -> filtre sur colonnes lat/lon si présentes
+    """
+    import requests
+
+    # 1) Construire la requête PostgREST
+    url = _sb_url("/rest/v1/pro_profiles?select=id,slug,display_name,sector,city,phone,whatsapp,website,about,images,audio_url,lat,lon,created_at,updated_at&order=updated_at.desc&limit=" + str(limit))
+    if id:
+        url += f"&id=eq.{id}"
+    if slug:
+        url += f"&slug=eq.{slug}"
+    if sector:
+        url += f"&sector=eq.{sector}"
+    if city:
+        # recherche partielle sur city
+        url += f"&city=ilike.*{city}*"
+    if q:
+        # recherche partielle sur display_name OU city (simple: on filtre city côté client ensuite)
+        url += f"&display_name=ilike.*{q}*"
+
+    r = requests.get(url, headers=_sb_headers(False), timeout=30)
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {getattr(e, 'response', r).text}")
+
+    items = r.json() or []
+
+    # 2) Filtre distance (si lat/lon fournis et radius_km défini)
+    if lat is not None and lon is not None and radius_km is not None:
+        from math import radians, sin, cos, asin, sqrt
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371.0
+            dlat = radians(lat2 - lat1)
+            dlon = radians(lon2 - lon1)
+            a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+            return 2 * R * asin(sqrt(a))
+
+        filtered = []
+        for it in items:
+            la = it.get("lat"); lo = it.get("lon")
+            if la is None or lo is None:
+                continue
+            try:
+                d = haversine(float(lat), float(lon), float(la), float(lo))
+            except Exception:
+                continue
+            if d <= float(radius_km):
+                it["_dist_km"] = round(d, 2)
+                filtered.append(it)
+        filtered.sort(key=lambda x: x.get("_dist_km", 9e9))
+        items = filtered
+
+    return {"items": items}
 
 # ------------------------- Submit Event -------------------------
 
@@ -1465,3 +1550,89 @@ def api_tts_chat(payload: dict):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS error: {e}")
+
+from fastapi import UploadFile, File, Form, HTTPException
+from typing import Optional, List
+import secrets, datetime, requests
+
+@app.post("/api/pro_submit")
+async def api_pro_submit(
+    display_name: str = Form(...),
+    slug: str = Form(...),
+    sector: str = Form(...),
+    city: str = Form(""),
+    phone: str = Form(""),
+    whatsapp: str = Form(""),
+    website: str = Form(""),
+    about: str = Form(""),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    edit_token: Optional[str] = Form(None),
+    images: Optional[List[UploadFile]] = File(None),
+    audio: Optional[UploadFile] = File(None),
+):
+    if supabase is None or not SET.SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service non configuré")
+
+    svc_headers = {
+        "apikey": SET.SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SET.SUPABASE_SERVICE_KEY}",
+    }
+
+    # Upload helpers
+    def put_storage(bucket: str, key: str, file: UploadFile):
+        url = f"{SET.SUPABASE_URL}/storage/v1/object/{bucket}/{key}"
+        data = file.file.read()
+        r = requests.post(url, headers=svc_headers, data=data)
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=400, detail=f"upload fail {bucket}/{key}: {r.text}")
+        return f"{bucket}/{key}"
+
+    now = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    base_folder = f"temetia-pro/{slug}-{now}-{secrets.token_hex(4)}"
+
+    img_paths = []
+    if images:
+        imgs = images[:3]  # max 3
+        for i, f in enumerate(imgs, start=1):
+            ext = (f.filename or "img").split(".")[-1].lower()
+            key = f"{base_folder}/img_{i}.{ext or 'jpg'}"
+            img_paths.append( put_storage("temetia-pro-images", key, f) )
+
+    audio_path = None
+    if audio:
+        ext = (audio.filename or "audio").split(".")[-1].lower()
+        key = f"{base_folder}/intro.{ext or 'mp3'}"
+        audio_path = put_storage("temetia-pro-audio", key, audio)
+
+    # Generate or verify edit token
+    token = edit_token or secrets.token_urlsafe(24)
+
+    # Upsert pro_profiles
+    rec = {
+        "slug": slug,
+        "display_name": display_name,
+        "sector": sector,
+        "city": city or None,
+        "phone": phone or None,
+        "whatsapp": whatsapp or None,
+        "website": website or None,
+        "about": about or None,            # nécessite colonne about (voir SQL ci-dessous)
+        "lat": lat,
+        "lon": lon,
+        "images": img_paths if img_paths else None,
+        "audio_url": audio_path,
+        "edit_token": token,               # nécessite colonne edit_token
+    }
+
+    # Merge with existing if edit_token matches or slug exists + token matches
+    # (2 colonnes suggérées: edit_token text unique, updated_at timestamp)
+    # Exemple: utiliser PostgREST upsert
+    url = f"{SET.SUPABASE_URL}/rest/v1/pro_profiles?slug=eq.{slug}"
+    headers = {**svc_headers, "Content-Type":"application/json", "Prefer":"resolution=merge-duplicates"}
+    import json
+    r = requests.post(url, headers=headers, data=json.dumps(rec))
+    if r.status_code not in (200,201,204):
+        raise HTTPException(status_code=400, detail=f"upsert fail: {r.text}")
+
+    return {"ok": True, "message":"Profil enregistré", "edit_token": token}
