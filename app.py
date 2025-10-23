@@ -1636,3 +1636,119 @@ async def api_pro_submit(
         raise HTTPException(status_code=400, detail=f"upsert fail: {r.text}")
 
     return {"ok": True, "message":"Profil enregistré", "edit_token": token}
+
+
+# --- KEMETIA: soumission / édition de profil PRO -----------------------------
+from fastapi import UploadFile, File, Form, HTTPException
+from typing import Optional, List
+import os, secrets, datetime, json, requests
+
+# ========== CONFIG ==========
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+# Renommage Temetia -> Kemetia
+BUCKET_IMG = "kemetia-pro-images"
+BUCKET_AUDIO = "kemetia-pro-audio"
+FOLDER_PREFIX = "kemetia-pro"
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    print("[WARN] Supabase service env vars missing; /api/pro_submit will fail")
+
+# ========== HELPERS ==========
+def _sb_headers(service: bool = False):
+    key = SUPABASE_SERVICE_KEY if service else (SUPABASE_ANON_KEY or SUPABASE_SERVICE_KEY)
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+
+def _sb_url(path: str) -> str:
+    return f"{SUPABASE_URL.rstrip('/')}{path}"
+
+def _storage_public_url(bucket: str, key: str) -> str:
+    # URL publique (si le bucket est PUBLIC dans Supabase Storage)
+    return f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{bucket}/{key}"
+
+def _upload_to_storage(bucket: str, key: str, uf: UploadFile) -> str:
+    """
+    Upload binaire dans Supabase Storage (POST /storage/v1/object/{bucket}/{key})
+    Renvoie l'URL publique.
+    """
+    svc_headers = _sb_headers(service=True)
+    url = _sb_url(f"/storage/v1/object/{bucket}/{key}")
+    data = uf.file.read()
+    r = requests.post(url, headers=svc_headers, data=data)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail=f"upload fail {bucket}/{key}: {r.text}")
+    return _storage_public_url(bucket, key)
+
+# ========== ROUTE ==========
+@app.post("/api/pro_submit")
+async def api_pro_submit(
+    display_name: str = Form(...),
+    slug: str = Form(...),
+    sector: str = Form(...),
+    city: str = Form(""),
+    phone: str = Form(""),
+    whatsapp: str = Form(""),
+    website: str = Form(""),
+    about: str = Form(""),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    edit_token: Optional[str] = Form(None),
+    images: Optional[List[UploadFile]] = File(None),  # max 3
+    audio: Optional[UploadFile] = File(None),         # ≤ 30s (vérif côté serveur à ajouter si besoin)
+):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase non configuré")
+
+    now = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    base_folder = f"{FOLDER_PREFIX}/{slug}-{now}-{secrets.token_hex(4)}"
+
+    # --- IMAGES (max 3) ---
+    img_urls: List[str] = []
+    if images:
+        imgs = images[:3]
+        for i, f in enumerate(imgs, start=1):
+            ext = (f.filename or "img").split(".")[-1].lower()
+            if ext not in {"jpg", "jpeg", "png", "webp", "gif"}:
+                ext = "jpg"
+            key = f"{base_folder}/img_{i}.{ext}"
+            img_urls.append(_upload_to_storage(BUCKET_IMG, key, f))
+
+    # --- AUDIO (optionnel) ---
+    audio_url = None
+    if audio:
+        ext = (audio.filename or "audio").split(".")[-1].lower()
+        if ext not in {"mp3", "m4a", "aac", "wav", "ogg", "webm"}:
+            ext = "mp3"
+        key = f"{base_folder}/intro.{ext}"
+        audio_url = _upload_to_storage(BUCKET_AUDIO, key, audio)
+
+    # --- TOKEN D'ÉDITION ---
+    token = edit_token or secrets.token_urlsafe(24)
+
+    # --- UPSERT PRO_PROFILE (slug unique) ---
+    rec = {
+        "slug": slug,
+        "display_name": display_name,
+        "sector": sector,
+        "city": city or None,
+        "phone": phone or None,
+        "whatsapp": whatsapp or None,
+        "website": website or None,
+        "about": about or None,
+        "lat": lat,
+        "lon": lon,
+        "images": img_urls if img_urls else None,
+        "audio_url": audio_url,
+        "edit_token": token,
+        "updated_at": datetime.datetime.utcnow().isoformat()
+    }
+
+    url = _sb_url(f"/rest/v1/pro_profiles?slug=eq.{slug}")
+    headers = { **_sb_headers(service=True), "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates" }
+    r = requests.post(url, headers=headers, data=json.dumps(rec))
+    if r.status_code not in (200, 201, 204):
+        raise HTTPException(status_code=400, detail=f"upsert fail: {r.text}")
+
+    return {"ok": True, "message": "Profil enregistré", "edit_token": token}
