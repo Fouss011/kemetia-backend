@@ -1752,3 +1752,16 @@ async def api_pro_submit(
         raise HTTPException(status_code=400, detail=f"upsert fail: {r.text}")
 
     return {"ok": True, "message": "Profil enregistré", "edit_token": token}
+
+@app.get("/api/pro_public")
+def api_pro_public(q: str | None = None, sector: str | None = None, city: str | None = None, limit: int = 500):
+    import requests, os
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+    url = f"{SUPABASE_URL}/rest/v1/pro_profiles?select=id,slug,display_name,sector,city,phone,whatsapp,website,about,images,audio_url,lat,lon,created_at,updated_at&order=updated_at.desc&limit={limit}"
+    if sector: url += f"&sector=eq.{sector}"
+    if city:   url += f"&city=ilike.*{city}*"
+    if q:      url += f"&display_name=ilike.*{q}*"
+    r = requests.get(url, headers={"apikey":SUPABASE_ANON_KEY,"Authorization":f"Bearer {SUPABASE_ANON_KEY}"}, timeout=30)
+    if r.status_code >= 400: raise HTTPException(status_code=502, detail=r.text)
+    return {"items": r.json() or []}
